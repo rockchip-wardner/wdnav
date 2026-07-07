@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyrkv"
+version = "0.1.0"
+description = "Python bindings and toolkit for the rkv key-value store"
+readme = "README.md"
+requires-python = ">=3.0"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "pyrkv maintainers"},
+]
+keywords = ["rkv", "key-value", "storage"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+]
+dependencies = [
+    # 第三方 Python 依赖，按需增删
+    # "msgpack>=1.0",
+    # "pyyaml>=5.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "build>=0.10",
+    "twine>=4.0",
+]
+
+[project.urls]
+Homepage = "https://example.com/pyrkv"
+Issues = "https://example.com/pyrkv/issues"
+
+# ---------------------------------------------------------------------------
+# setuptools 配置：src layout，并打包 native/ 下的 .so 进 wheel
+# ---------------------------------------------------------------------------
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["rkv*"]
+
+# 把 native/ 下的 .so 等二进制文件打进 src/rkv/_native/，随 wheel 发布
+[tool.setuptools.package-data]
+rkv = [
+    "_native/*.so",
+    "_native/*.so.*",
+    "_native/*.dylib",
+    "_native/*.dll",
+    "py.typed",
+]
+
+[tool.setuptools.data-files]
+"rkv/native" = [
+    "native/*.so",
+    "native/*.so.*",
+]
+
+# ---------------------------------------------------------------------------
+# 常用工具配置
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "6.0"
+testpaths = ["tests"]
+addopts = "-ra -q"
+
+[tool.build]
+wheel = true

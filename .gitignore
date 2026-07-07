@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 二进制：默认忽略，但 native/ 下要随包发布的 .so 用白名单放回
+*.so
+*.so.*
+*.dylib
+*.dll
+!native/*.so
+!native/*.so.*
+
+# 打包产物
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# 测试/虚拟环境
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+env/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# native 构建产物（按需保留）
+native/build/
+native/target/
+native/cmake-build-*/

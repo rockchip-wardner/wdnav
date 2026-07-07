@@ -1,0 +1,20 @@
+# 源码分发包（sdist）需要额外带的文件
+include README.md
+include LICENSE
+include MANIFEST.in
+include pyproject.toml
+
+# 把 native/ 下的 .so 一起打包进 sdist
+recursive-include native *.so *.so.* *.dylib *.dll
+recursive-include native *.h *.c *.cc *.cpp *.rs
+
+# 类型 stub
+include src/rkv/py.typed
+include src/rkv/*.pyi
+
+# 排除常见的临时/构建产物
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .pytest_cache
+global-exclude *.egg-info
+global-exclude build dist .tox .venv
