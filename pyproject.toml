@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pyrkv"
 version = "0.1.0"
-description = "Python bindings and toolkit for the rkv key-value store"
+description = "Python toolkit for the rkv key-value store and Rockchip MPP/RGA video decoder"
 readme = "README.md"
-requires-python = ">=3.0"
+requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "pyrkv maintainers"},
 ]
-keywords = ["rkv", "key-value", "storage"]
+keywords = ["rkv", "key-value", "storage", "rockchip", "mpp", "rga", "video", "decoder"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -20,12 +20,18 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Database",
+    "Topic :: Multimedia :: Video",
 ]
+# 第三方 Python 依赖。VideoCapture（av/cv2/numpy）只会在显式 import 时
+# 触发；纯 KV 用户（只用 Rkv）不会强制装这些。
 dependencies = [
-    # 第三方 Python 依赖，按需增删
-    # "msgpack>=1.0",
-    # "pyyaml>=5.1",
+    "av>=10.0",
+    "opencv-python>=4.5",
+    "numpy>=1.20",
 ]
 
 [project.optional-dependencies]
@@ -49,20 +55,15 @@ package-dir = {"" = "src"}
 where = ["src"]
 include = ["rkv*"]
 
-# 把 native/ 下的 .so 等二进制文件打进 src/rkv/_native/，随 wheel 发布
+# 把 src/rkv/_native/ 下的 .so 符号链接（指向 native/）打进 wheel 的 rkv/_native/
 [tool.setuptools.package-data]
 rkv = [
     "_native/*.so",
     "_native/*.so.*",
+    "_native/*.so.*.*",
     "_native/*.dylib",
     "_native/*.dll",
     "py.typed",
-]
-
-[tool.setuptools.data-files]
-"rkv/native" = [
-    "native/*.so",
-    "native/*.so.*",
 ]
 
 # ---------------------------------------------------------------------------
