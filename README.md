@@ -48,8 +48,11 @@ python -m build
 
 ```python
 import rkv
+cap = rkv.VideoCapture(path)  # 这里path可以是本地文件也可以是网络流，也可以是v4l2设备
+ret, frame = cap.read()  # 读取一帧，与cv2的用法是一致的，返回的格式也是一致的
+ret, frame = cap.read(w, h, fmt)  # 这是cv2没有的接口，使用RGA对输出的格式分辨率进行的指定转换 
 
-# 详细示例见 samples/ 目录
+# 其他详细示例见 samples/ 目录
 ```
 
 ## 兼容性
