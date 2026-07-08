@@ -1,6 +1,7 @@
 # pyrkv
 
-> Python 版的 rkv 工具包 —— 包含纯 Python 实现、捆绑本地 .so、以及对第三方 Python 库的依赖。
+> 纯 Python 实现的 rockchip 硬件编解码和硬件2D加速器封装包，封装了libmpp和librga的python ctypes实现，
+> 使用pyav和python-v4l2来实现前端协议和文件格式解析以及demux，后端对接vpu与rga，兼容cv2接口，可直接使用cv2做后续算法与显示。
 
 ## 项目结构
 

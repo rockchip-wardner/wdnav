@@ -35,6 +35,8 @@ import av
 import cv2
 import numpy as np
 
+from . import v4l2 as _v4l2_mod
+
 from . import rga
 from .mpp import (
     CODING_BY_NAME,
@@ -69,18 +71,24 @@ _FRAME_BGR_FORMATS = frozenset(_MPP_TO_RGA_FMT.keys())
 
 
 class VideoCapture:
-    """OpenCV-style interface to the MPP hardware decoder.
+    """OpenCV-style interface to the MPP hardware decoder / V4L2 camera.
 
     Iterates an MP4 (or any container PyAV can read) and returns BGR
-    frames as ``numpy.ndarray`` shaped ``(H, W, 3)``.
+    frames as ``numpy.ndarray`` shaped ``(H, W, 3)``. Also supports
+    local cameras via V4L2 capture nodes (``/dev/videoX``); the
+    output is the same BGR ndarray, but the conversion is done by
+    ffmpeg / libswscale instead of the VPU.
 
     Parameters
     ----------
     path:
-        Path to the input media file or a network URL (``rtsp://``,
-        ``http://``, ``tcp://`` …). PyAV's container layer handles the
+        Path to the input media file, a network URL (``rtsp://``,
+        ``http://``, ``tcp://`` …), or a V4L2 capture node
+        (``/dev/video0`` etc.). PyAV's container layer handles the
         protocol; the codec must be one of the formats MPP knows how to
-        decode (H.264, HEVC, VP9, AV1, …).
+        decode (H.264, HEVC, VP9, AV1, …) — for raw-camera streams
+        the "codec" is just the pixel format (NV12 / YUYV / MJPEG),
+        which ffmpeg demuxes as ``rawvideo``.
     options:
         Optional dict of demuxer options forwarded to ffmpeg. For RTSP
         you typically want ``{"rtsp_transport": "tcp"}`` so the video
@@ -93,15 +101,32 @@ class VideoCapture:
         that might be unreachable; ``None`` lets PyAV block indefinitely.
     output_size:
         Optional ``(width, height)`` to scale every decoded frame to.
-        Resize is done in hardware by the 2D RGA engine (RGA2) on the
-        same SOC as the VPU, so it costs essentially nothing compared
-        to running a software scaler. ``None`` keeps the native frame
-        size.
+        For file sources the resize is done in hardware by the 2D RGA
+        engine (RGA2) on the same SOC as the VPU; for V4L2 sources it's
+        done by libswscale (still single-pass, software). ``None`` keeps
+        the native frame size.
     use_rga:
         When ``True`` (default), hardware-color-convert NV12 → BGR via
-        RGA2. Set ``False`` to fall back to ``cv2.cvtColor`` — useful
-        when RGA isn't available, or when reproducing a bug that
-        doesn't appear in the RGA path.
+        RGA2 (file sources only). Set ``False`` to fall back to
+        ``cv2.cvtColor`` — useful when RGA isn't available, or when
+        reproducing a bug that doesn't appear in the RGA path. Ignored
+        for V4L2 sources (they always go through libswscale).
+    v4l2_input_format:
+        V4L2-only. Pixel format to request from the sensor / ISP —
+        e.g. ``"nv12"``, ``"yuyv422"``, ``"mjpeg"``. ``None`` lets the
+        driver pick (usually whatever is currently configured).
+    v4l2_size:
+        V4L2-only. ``(width, height)`` to request. ``None`` keeps the
+        driver's current setting.
+    v4l2_framerate:
+        V4L2-only. Frames per second to request. ``None`` keeps the
+        driver's current setting.
+
+    Notes
+    -----
+    Media Controller paths (``/dev/mediaX``) are **not** opened directly
+    — use :class:`rkv.media.MediaDevice` to inspect / configure the
+    pipeline first, then pass the resulting capture node to this class.
     """
 
     def __init__(
@@ -111,10 +136,35 @@ class VideoCapture:
         timeout: Optional[float] = 10.0,
         output_size: Optional[Tuple[int, int]] = None,
         use_rga: bool = True,
+        *,
+        v4l2_input_format: Optional[str] = None,
+        v4l2_size: Optional[Tuple[int, int]] = None,
+        v4l2_framerate: Optional[int] = None,
     ) -> None:
+        path_str = str(path)
+
+        # Route based on path prefix. /dev/videoX is V4L2 capture;
+        # /dev/mediaX is topology — refuse and point at MediaDevice.
+        if path_str.startswith("/dev/media"):
+            raise RuntimeError(
+                f"{path_str}: this is a Media Controller device, not a "
+                f"capture node. Use rkv.media.MediaDevice to inspect / "
+                f"configure the pipeline, then open the resulting "
+                f"/dev/videoX with VideoCapture."
+            )
+        if path_str.startswith("/dev/video"):
+            self._init_v4l2(
+                path_str,
+                input_format=v4l2_input_format,
+                size=v4l2_size,
+                framerate=v4l2_framerate,
+                output_size=output_size,
+            )
+            return
+
+        # Default: file / URL via PyAV container + MPP hardware decoder.
         # str(path) lets URLs through unmodified; Path.is_file() is only
         # used to give a friendlier error for the local-file case.
-        path_str = str(path)
         local = Path(path)
         if "://" not in path_str and not local.is_file():
             raise FileNotFoundError(f"VideoCapture: no such file {local}")
@@ -147,8 +197,9 @@ class VideoCapture:
 
         # Live streams (RTSP, HTTP, etc.) never EOF. Detect by looking at
         # the protocol: anything with "://" is treated as live so we keep
-        # the demuxer open until the caller calls release().
-        self._is_live: bool = "://" in path_str
+        # the demuxer open until the caller calls release(). V4L2 nodes
+        # are also "live" — there's no file EOF, only release() stops them.
+        self._is_live: bool = "://" in path_str or path_str.startswith("/dev/video")
         self._path_str: str = path_str
 
         # Hardware-assisted output path. RGA2 lives on the same SOC as the
@@ -171,8 +222,81 @@ class VideoCapture:
         )
         self._sent_extradata = not self._sps_pps
         self._codec_name = codec_name
+        self._is_v4l2: bool = False
         self._opened = True
         self._eof = False
+
+    # -- V4L2 init ----------------------------------------------------------
+
+    def _init_v4l2(
+        self,
+        path: str,
+        *,
+        input_format: Optional[str],
+        size: Optional[Tuple[int, int]],
+        framerate: Optional[int],
+        output_size: Optional[Tuple[int, int]],
+    ) -> None:
+        """Open a /dev/videoX node via rkv.v4l2.V4L2Capture.
+
+        ``v4l2_input_format`` is a FourCC string (e.g. ``"nv12"``,
+        ``"yuyv"``). ``v4l2_size`` and ``v4l2_framerate`` default to
+        ``None`` (= keep the driver's current setting).
+        """
+        if not input_format:
+            input_format = "nv12"   # most ISP outputs default to NV12
+        if not size:
+            size = (640, 480)
+        # framerate isn't used by V4L2Capture (driver keeps what it has);
+        # recorded here only for the public property.
+        self._v4l2_input_format = input_format
+        self._v4l2_size = size
+        self._v4l2_framerate = framerate
+
+        self._v4l2_cap = _v4l2_mod.V4L2Capture(
+            path,
+            width=size[0],
+            height=size[1],
+            pixel_format=input_format,
+            num_buffers=4,
+        )
+
+        self.width: int = self._v4l2_cap.width
+        self.height: int = self._v4l2_cap.height
+        # V4L2 doesn't surface framerate via QUERYCAP; preserve user input.
+        self.fps: float = float(framerate or 0)
+        self.frame_pos: int = 0
+        self._is_live: bool = True
+        self._path_str: str = path
+
+        # The V4L2 buffer queue yields raw NV12/YUYV/etc. — we do the
+        # BGR conversion in _v4l2_to_bgr via cv2.
+        self._output_size: Optional[Tuple[int, int]] = output_size
+        self._use_rga: bool = False
+        self._decoder = None
+        self._codec_name: Optional[str] = None
+        self._sps_pps = b""
+        self._sent_extradata = True
+        self._is_v4l2: bool = True
+        self._opened = True
+        self._eof = False
+        # Try to start the capture queue. STREAMON fails with EPERM when
+        # no sensor is feeding the pipeline (e.g. on a board where the
+        # sensor module is physically disconnected). Surface a clear
+        # error in that case so callers don't see a bare errno.
+        try:
+            self._v4l2_cap.start()
+        except OSError as e:
+            self._opened = False
+            try:
+                self._v4l2_cap.close()
+            except Exception:
+                pass
+            self._v4l2_cap = None
+            raise RuntimeError(
+                f"{path}: cannot start streaming ({e.strerror or e}). "
+                f"Is a sensor connected and the ISP pipeline configured?"
+            ) from e
 
     # -- OpenCV-style API ---------------------------------------------------
 
@@ -184,11 +308,16 @@ class VideoCapture:
 
         For local files this returns ``(True, bgr)`` for every frame and
         ``(False, None)`` once the file is exhausted. For live streams
-        (RTSP, HTTP) it loops forever; the caller has to call
-        :meth:`release` to stop.
+        (RTSP, HTTP, V4L2 cameras) it loops forever; the caller has to
+        call :meth:`release` to stop.
         """
         if not self._opened or self._eof:
             return False, None
+
+        # V4L2 cameras skip MPP entirely — the VPU has nothing to do on
+        # raw pixels, and the V4L2 demuxer yields decoded frames directly.
+        if getattr(self, "_is_v4l2", False):
+            return self._read_v4l2()
 
         # Phase 1: feed more packets from PyAV and surface any frame
         # produced along the way. We yield the *first* decoded frame we
@@ -237,6 +366,164 @@ class VideoCapture:
             if self._container is not None:
                 self._container.close()
             self._container = None  # type: ignore[assignment]
+            if getattr(self, "_v4l2_cap", None) is not None:
+                try:
+                    self._v4l2_cap.close()
+                except Exception:
+                    pass
+                self._v4l2_cap = None
+
+    # -- V4L2 read path -----------------------------------------------------
+
+    def _read_v4l2(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """Pull one decoded frame from a V4L2 capture node.
+
+        Loops forever for live sources (cameras have no EOF); the caller
+        must call :meth:`release` to stop. Each V4L2 buffer is converted
+        to BGR via cv2 (single-pass software path) before returning.
+        """
+        cap = self._v4l2_cap
+        if cap is None:
+            return False, None
+        buf = cap.dequeue(timeout_s=2.0)
+        if buf is None:
+            return False, None
+        try:
+            bgr = self._v4l2_to_bgr(buf)
+        finally:
+            cap.requeue(buf)
+        if bgr is not None:
+            self.frame_pos += 1
+            return True, bgr
+        return False, None
+
+    def _v4l2_to_bgr(self, buf: "_v4l2_mod.V4L2BufferInfo") -> Optional[np.ndarray]:
+        """Convert a V4L2 raw buffer into a contiguous BGR ndarray.
+
+        Two paths, picked per call:
+
+        - **RGA zero-copy** (default for NV12/NV21 with a valid DMA-BUF fd):
+          ``rga.wrap_nv12_fd`` + ``rga.cvtcolor`` / ``rga.resize`` against the
+          destination BGR888 mmap buffer. Honours ``output_size`` via the
+          RGA scaler. Falls back to cv2 if RGA rejects the configuration
+          (odd stride, unusual colour space, etc.).
+        - **cv2 fallback** (for YUYV / UYVY / formats RGA doesn't understand,
+          or when the driver didn't give us an EXPBUF fd).
+
+        In both paths the returned ndarray borrows the destination buffer
+        memory, so callers who need to keep a frame past the next read()
+        should ``.copy()`` it.
+        """
+        fmt = buf.pixel_format.upper()
+
+        # -------- RGA fast path: NV12 / NV21 with DMA-BUF fd --------
+        if (
+            self._use_rga
+            and fmt in ("NV12", "NV21")
+            and buf.plane_fds
+            and buf.plane_fds[0] >= 0
+            and len(buf.plane_arrays) >= 2
+        ):
+            bgr = self._v4l2_rga_to_bgr(buf)
+            if bgr is not None:
+                return bgr
+            # RGA rejected the configuration — fall through to cv2.
+
+        # -------- cv2 fallback --------
+        if fmt == "NV12":
+            if len(buf.plane_arrays) != 2:
+                return None
+            y = buf.plane_arrays[0].reshape(buf.height, buf.width)
+            uv = buf.plane_arrays[1].reshape(buf.height // 2, buf.width)
+            h2 = buf.height * 3 // 2
+            yuv = np.empty(h2 * buf.width, dtype=np.uint8)
+            yuv[: buf.height * buf.width] = y.reshape(-1)
+            yuv[buf.height * buf.width:] = uv.reshape(-1)
+            yuv = yuv.reshape(h2, buf.width)
+        elif fmt == "NV21":
+            if len(buf.plane_arrays) != 2:
+                return None
+            # NV21 = same as NV12 but UV order swapped in the chroma plane.
+            # cv2.COLOR_YUV2BGR_NV21 handles the swap for us if we pass the
+            # same stacked buffer shape.
+            y = buf.plane_arrays[0].reshape(buf.height, buf.width)
+            uv = buf.plane_arrays[1].reshape(buf.height // 2, buf.width)
+            h2 = buf.height * 3 // 2
+            yuv = np.empty(h2 * buf.width, dtype=np.uint8)
+            yuv[: buf.height * buf.width] = y.reshape(-1)
+            yuv[buf.height * buf.width:] = uv.reshape(-1)
+            yuv = yuv.reshape(h2, buf.width)
+        elif fmt == "YUYV":
+            raw = buf.plane_arrays[0]
+            yuv = raw.reshape(buf.height, buf.width, 2)[..., 0]
+            return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_YUYV)
+        elif fmt == "UYVY":
+            raw = buf.plane_arrays[0]
+            yuv = raw.reshape(buf.height, buf.width, 2)[..., 1]
+            return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_UYVY)
+        else:
+            return None
+
+        if fmt in ("NV12", "NV21"):
+            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12 if fmt == "NV12" else cv2.COLOR_YUV2BGR_NV21)
+        if self._output_size is not None:
+            bgr = cv2.resize(
+                bgr, (self._output_size[0], self._output_size[1])
+            )
+        return bgr
+
+    # -- RGA zero-copy helpers (shared with the MPP path) --------------------
+
+    def _ensure_bgr_buffer(self, width: int, height: int) -> "ctypes.Array":
+        """Allocate (or reuse) the RGA dst BGR buffer for ``(width, height)``."""
+        # Reuse the existing attr if already set up by the MPP path.
+        # If not, lazy-init here.
+        if not hasattr(self, "_bgr_buf_key") or self._bgr_buf_key != (width, height):
+            size = width * height * 3   # BGR888 = 3 bytes/pixel
+            self._bgr_buf = (ctypes.c_uint8 * size)()
+            self._bgr_buf_key = (width, height)
+        return self._bgr_buf
+
+    def _v4l2_rga_to_bgr(self, buf: "_v4l2_mod.V4L2BufferInfo") -> Optional[np.ndarray]:
+        """Hardware NV12/NV21 → BGR via RGA2 from a V4L2 DMA-BUF fd.
+
+        Mirrors ``_rga_to_bgr`` (the MPP path) but uses ``buf.plane_fds[0]``
+        (the DMA-BUF fd exported via VIDIOC_EXPBUF) instead of
+        ``frame.fd``. Honours ``self._output_size``: if set, dispatches to
+        ``rga.resize`` instead of ``rga.cvtcolor`` so the scaling happens
+        in the same hardware pass.
+        """
+        from . import rga
+
+        if buf.plane_fds[0] < 0:
+            return None
+
+        out_w, out_h = self._output_size or (buf.width, buf.height)
+        # Single-planar capture → mmap buffer is at offset 0; stride = width.
+        # Multiplanar NV12: plane 0 (Y) has stride=width, plane 1 (UV)
+        # stride=width. RGA's wrap_nv12_fd uses these strides directly.
+        try:
+            src = rga.wrap_nv12_fd(
+                buf.plane_fds[0], buf.width, buf.height,
+                hor_stride=buf.width, ver_stride=buf.height,
+            )
+        except RuntimeError:
+            return None
+
+        buf_storage = self._ensure_bgr_buffer(out_w, out_h)
+        dst = rga.wrap_virtual(
+            ctypes.addressof(buf_storage), out_w, out_h, rga.RgaFormat.BGR_888
+        )
+        try:
+            if (out_w, out_h) == (buf.width, buf.height):
+                rga.cvtcolor(src, dst)
+            else:
+                rga.resize(src, dst)
+            rga.flush()
+        except RuntimeError:
+            return None
+
+        return np.frombuffer(buf_storage, dtype=np.uint8).reshape(out_h, out_w, 3)
 
     # -- context manager / destructor --------------------------------------
 

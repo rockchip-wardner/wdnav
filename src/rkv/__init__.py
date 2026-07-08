@@ -25,6 +25,20 @@ try:
 except Exception:  # pragma: no cover - platform-specific load failure
     VideoCapture = None
 
+# ``MediaDevice`` 需要 ``media-ctl`` 在 PATH 上；缺工具时同样设为 None。
+try:
+    from .media import (
+        MediaDevice,
+        MediaEntity,
+        MediaLink,
+        MediaPad,
+    )
+except Exception:  # pragma: no cover - missing media-ctl or parse failure
+    MediaDevice = None  # type: ignore[assignment]
+    MediaEntity = None  # type: ignore[assignment]
+    MediaLink = None    # type: ignore[assignment]
+    MediaPad = None     # type: ignore[assignment]
+
 __all__ = [
     "__version__",
     "Backend",
@@ -35,4 +49,8 @@ __all__ = [
     "RkvError",
     "make_backend",
     "VideoCapture",
+    "MediaDevice",
+    "MediaEntity",
+    "MediaLink",
+    "MediaPad",
 ]
