@@ -162,6 +162,31 @@ _BPP = {
 }
 
 
+# Reverse lookup: format code -> symbolic name. Built once at
+# import from the public RgaFormat class so users (and warning
+# messages) see "BGR_888" instead of "0x700". Built from
+# vars() so any new constants added to RgaFormat are picked
+# up automatically. dunder / private attributes are filtered
+# out. Aliased formats (e.g. YV12_420_P == YCbCr_420_P) collapse
+# to whichever name comes first in vars() ordering; that's
+# fine for human-readable diagnostics.
+_FORMAT_NAMES: dict = {
+    v: k for k, v in vars(RgaFormat).items()
+    if not k.startswith("_") and isinstance(v, int)
+}
+
+
+def format_name(fmt: int) -> str:
+    """Return the symbolic name for a RgaFormat code (e.g. ``"BGR_888"``).
+
+    Falls back to ``"0x<hex>"`` for unknown codes — useful when a
+    future rga.h revision adds a format we haven't taught the
+    wrapper about yet, or when a flag-packed value (e.g. stride
+    bits in the low byte) doesn't match a constant exactly.
+    """
+    return _FORMAT_NAMES.get(fmt, f"0x{fmt:x}")
+
+
 def bytes_per_pixel(fmt: int) -> float:
     """BPP for a format, as a float. NV12/I420 = 1.5, RGB = 3, RGBA = 4."""
     try:
@@ -846,6 +871,7 @@ __all__ = [
     "im_nn_t",
     "Buffer",
     "bytes_per_pixel",
+    "format_name",
     "vendor",
     "version",
     "max_input_resolution",

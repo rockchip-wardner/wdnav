@@ -723,7 +723,27 @@ class MppDecoder:
                 _lib.mpp_frame_deinit(byref(frame))
                 return None
 
+            # Drop frames the VPU itself doesn't want surfaced:
+            # - discard: reference / B-frames the decoder skipped
+            # - errinfo: frames that hit a decode error
+            # Both come through mpp_frame_get_buffer with a NULL
+            # MppBuffer; without this filter we'd fall into the
+            # mpp_buffer_get_ptr / _fd calls below and the C side
+            # would log "invalid NULL input from rkv-mpp" warnings.
+            # Matches mpi_dec_test.c's discard/errinfo handling.
+            if _lib.mpp_frame_get_discard(frame) or _lib.mpp_frame_get_errinfo(frame):
+                _lib.mpp_frame_deinit(byref(frame))
+                return None
+
             buf = _lib.mpp_frame_get_buffer(frame)
+            # Defensive: even after the discard / errinfo filter, some
+            # internal frames (e.g. placeholders near EOS) come back
+            # with no buffer attached. mpp_buffer_get_ptr_with_caller
+            # / _fd both log an error on NULL — bail out cleanly
+            # instead of spamming the log.
+            if not buf:
+                _lib.mpp_frame_deinit(byref(frame))
+                return None
             ptr = _lib.mpp_buffer_get_ptr_with_caller(buf, b"rkv-mpp")
             # mpp_buffer_get_fd returns -1 when the buffer has no fd
             # (e.g. a NORMAL malloc-backed buffer, not a DMA one). The

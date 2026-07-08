@@ -116,6 +116,21 @@ def _resolve_output_format(fmt: Optional[str]) -> Tuple[int, float, str]:
         ) from e
 
 
+def _demuxer_options_for(path_str: str) -> dict:
+    """Pick ffmpeg demuxer options based on the source's URL scheme.
+
+    Centralises protocol-specific tuning so the caller never has to
+    know about ffmpeg's ``-option value`` plumbing. Add new schemes
+    here as the need arises; local files and ``/dev/videoX`` return
+    an empty dict (no ffmpeg-level overrides required).
+    """
+    if path_str.startswith("rtsp://"):
+        # ffmpeg's RTSP default is UDP; on lossy networks this drops
+        # frames silently. TCP is the only safe choice for live ingest.
+        return {"rtsp_transport": "tcp"}
+    return {}
+
+
 def _as_ndarray(
     buf_storage: "ctypes.Array",
     width: int,
@@ -165,12 +180,9 @@ class VideoCapture:
         protocol; the codec must be one of the formats MPP knows how to
         decode (H.264, HEVC, VP9, AV1, …) — for raw-camera streams
         the "codec" is just the pixel format (NV12 / YUYV / MJPEG),
-        which ffmpeg demuxes as ``rawvideo``.
-    options:
-        Optional dict of demuxer options forwarded to ffmpeg. For RTSP
-        you typically want ``{"rtsp_transport": "tcp"}`` so the video
-        stream isn't lost to UDP jitter. Ignored if the protocol doesn't
-        accept it.
+        which ffmpeg demuxes as ``rawvideo``. Protocol-specific demuxer
+        options (e.g. ``rtsp_transport=tcp`` for RTSP) are applied
+        automatically and are not exposed on this API.
     timeout:
         Seconds to wait for the container to open *and* for each
         subsequent read. Accepts a float (single value) or a
@@ -209,7 +221,6 @@ class VideoCapture:
     def __init__(
         self,
         path: str | Path,
-        options: Optional[dict] = None,
         timeout: Optional[float] = 10.0,
         output_size: Optional[Tuple[int, int]] = None,
         use_rga: bool = True,
@@ -247,6 +258,7 @@ class VideoCapture:
             raise FileNotFoundError(f"VideoCapture: no such file {local}")
 
         kwargs = {}
+        options = _demuxer_options_for(path_str)
         if options:
             kwargs["options"] = options
         if timeout is not None:
@@ -649,9 +661,16 @@ class VideoCapture:
         except RuntimeError:
             return None
 
-        buf_storage = self._ensure_bgr_buffer(target_w, target_h, fmt=hw_fmt)
+        # Same 16-aligned dst-stride dance as the MPP path: RGA2
+        # rejects dst.wstride values that aren't multiples of 16
+        # for RGB-family output. Round up, allocate the buffer
+        # with the aligned width, and slice the result back to
+        # target_w before returning.
+        rga_w = (target_w + 15) & ~15
+
+        buf_storage = self._ensure_bgr_buffer(rga_w, target_h, fmt=hw_fmt)
         dst = rga.wrap_virtual(
-            ctypes.addressof(buf_storage), target_w, target_h, hw_fmt
+            ctypes.addressof(buf_storage), rga_w, target_h, hw_fmt
         )
         try:
             if (target_w, target_h) == (buf.width, buf.height) or hw_layout != "HWC":
@@ -664,8 +683,8 @@ class VideoCapture:
 
         if layout == "HWC" and rga_fmt != rga.RgaFormat.BGR_888:
             bgr_view = np.frombuffer(buf_storage, dtype=np.uint8).reshape(
-                target_h, target_w, 3
-            )
+                target_h, rga_w, 3
+            )[:, :target_w]
             if rga_fmt == rga.RgaFormat.RGB_888:
                 return cv2.cvtColor(bgr_view, cv2.COLOR_BGR2RGB)
             if rga_fmt == rga.RgaFormat.BGRA_8888:
@@ -673,7 +692,10 @@ class VideoCapture:
             if rga_fmt == rga.RgaFormat.RGBA_8888:
                 return cv2.cvtColor(bgr_view, cv2.COLOR_BGR2RGBA)
 
-        return _as_ndarray(buf_storage, target_w, target_h, hw_bpp, hw_layout)
+        out = _as_ndarray(buf_storage, rga_w, target_h, hw_bpp, hw_layout)
+        if rga_w != target_w:
+            out = out[:, :target_w]
+        return out
 
     # -- context manager / destructor --------------------------------------
 
@@ -856,14 +878,14 @@ class VideoCapture:
         # exception path is real. On RGA3 (RK3588+) every conversion
         # succeeds and the cv2 path is never taken.
 
-        # Step 1: try RGA NV12 → target format directly.
+        # Step 1: try RGA NV12 → target format directly. RGA2_Enhance
+        # and RGA3 both support every HWC family (BGR_888, RGB_888,
+        # BGRA_8888, RGBA_8888), so on most callers this step
+        # produces the answer with no post-processing. rga.output_
+        # formats()'s printed list omits BGR_888 / BGRA_8888 even
+        # though the cores handle them, so don't trust that string
+        # as a capability check — try and see.
         bgr_ndarray: Optional[np.ndarray] = None
-        # Step 1 may produce the target format directly (RGA-native
-        # NV12→{BGR,NV12,NV21,GRAY}). Step 2 always produces BGR_888
-        # (used as a base for the cv2 post-process). ``rga_native_format``
-        # is True only when Step 1 succeeded AND the result is in the
-        # target layout — that's the only case where the early-return
-        # below can skip post-processing.
         rga_native_format = False
         try:
             bgr_ndarray = self._rga_nv12_to(
@@ -873,11 +895,13 @@ class VideoCapture:
         except RuntimeError:
             bgr_ndarray = None
 
-        # Step 2: if direct RGA didn't produce BGR, try RGA → BGR +
-        # cv2-post. The cv2 step gives us channel swap / alpha insert.
-        # Note: we don't set rga_native_format here — Step 2 always
-        # writes BGR_888 regardless of the user's target format, so
-        # the post-process still needs to run.
+        # Step 2: try RGA NV12 → BGR_888. Step 1 failed (usually
+        # because the dst format is exotic — NV12 → RGBA on cores
+        # where the alpha path isn't wired, or a stride that the
+        # core's allocator can't satisfy). BGR_888 is the cheapest
+        # universally-supported HWC format and what the post-
+        # process helpers expect. _rga_nv12_to handles the 16-aligned
+        # dst-width requirement.
         if bgr_ndarray is None:
             try:
                 bgr_ndarray = self._rga_nv12_to(
@@ -889,13 +913,13 @@ class VideoCapture:
         # Step 3: if RGA is completely unavailable, fall back to cv2.
         if bgr_ndarray is None:
             # Both RGA attempts failed; surface that to the operator.
-            # This happens on RGA2 when the requested conversion
-            # (e.g. NV12→BGRA at this resolution) isn't supported by
-            # the active core. The cv2 path is correct but ~5-10x
+            # On RGA2 this happens for rare combinations (e.g. NV12
+            # → GRAY at odd widths, or sizes beyond the core's
+            # maximum output). The cv2 path is correct but ~5-10x
             # slower than the RGA path, so make it visible.
             import sys
             print(
-                f"[rkv] RGA failed for NV12→0x{rga_fmt:x} at "
+                f"[rkv] RGA failed for NV12→{rga.format_name(rga_fmt)} at "
                 f"{target_w}x{target_h}; falling back to cv2",
                 file=sys.stderr, flush=True,
             )
@@ -912,14 +936,18 @@ class VideoCapture:
         # already have the answer. No post-process needed.
         if rga_native_format and (rga_fmt, layout) in (
             (rga.RgaFormat.BGR_888, "HWC"),
+            (rga.RgaFormat.RGB_888, "HWC"),
             (rga.RgaFormat.YCbCr_420_SP, "YUV"),
             (rga.RgaFormat.YCrCb_420_SP, "YUV"),
             (rga.RgaFormat.YCbCr_400, "GRAY"),
         ):
             return bgr_ndarray
 
-        # RGA gave us BGR (or we fell back to cv2 BGR); convert to
-        # the requested target format via cv2.
+        # RGA gave us BGR (Step 1 with a BGR-family rga_fmt, or Step
+        # 2's BGR_888 fallback, or the cv2 path). Convert to the
+        # requested target format via cv2. The BGR→X cvtColor codes
+        # / _bgr_to_nv12 / _bgr_to_nv21 helpers all expect BGR
+        # input — by the time we reach here, that's what we have.
         if rga_fmt == rga.RgaFormat.BGR_888:
             return bgr_ndarray
         if rga_fmt == rga.RgaFormat.RGB_888:
@@ -971,9 +999,21 @@ class VideoCapture:
             except RuntimeError:
                 raise
 
-        buf = self._ensure_bgr_buffer(target_w, target_h, fmt=target_fmt)
+        # RGA2 (and several RGA3 firmwares) require the dst width /
+        # stride to be 16-aligned for RGB-family output formats —
+        # imcheck rejects with "rgb888 width stride should be 16
+        # aligned" otherwise (verified on the RGA2_Enhance + RGA3
+        # core in im2d v1.10.4). The source side is fine: MPP
+        # already hands us hor_stride=1376 for a 1366-wide H.264
+        # frame, which is 16-aligned. Round the dst up to a
+        # 16-multiple, allocate the buffer with that aligned width,
+        # and slice the result back to the caller's target_w before
+        # returning.
+        rga_w = (target_w + 15) & ~15
+
+        buf = self._ensure_bgr_buffer(rga_w, target_h, fmt=target_fmt)
         dst = rga.wrap_virtual(
-            ctypes.addressof(buf), target_w, target_h, target_fmt,
+            ctypes.addressof(buf), rga_w, target_h, target_fmt,
         )
         # Same-size uses cvtcolor; otherwise resize. YUV / GRAY dsts
         # always use cvtcolor because imresize_t rejects YCbCr_400.
@@ -982,7 +1022,14 @@ class VideoCapture:
         else:
             rga.resize(src, dst)
         rga.flush()
-        return _as_ndarray(buf, target_w, target_h, target_bpp, target_layout)
+        # Strip the right-edge padding columns (rga_w - target_w of
+        # them) so the returned ndarray is exactly the requested
+        # resolution. _as_ndarray reshapes the underlying storage
+        # using rga_w, so the column slice is what trims the view.
+        out = _as_ndarray(buf, rga_w, target_h, target_bpp, target_layout)
+        if rga_w != target_w:
+            out = out[:, :target_w]
+        return out
 
 
 def _bgr_to_nv12(bgr: np.ndarray) -> np.ndarray:
