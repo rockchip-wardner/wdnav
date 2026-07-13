@@ -1,71 +1,28 @@
 # -*- coding: utf-8 -*-
-"""冒烟测试：保证 rkv 包能 import 并且 PythonBackend 可以正常工作。
+"""冒烟测试：保证 rkv 包能 import，公开符号存在，version 是非空字符串。
 
-不依赖 .so —— 即使 native 库缺失，这个测试也应当通过。
+VideoCapture / MediaDevice 在非 Rockchip 平台会被 ``__init__`` 的 try/except
+设成 ``None``（没有 librockchip_mpp / librga / media-ctl）。本测试不依赖
+native 库，也不会尝试实际加载——它在开发机 / CI / Rockchip 目标机上行为一致。
 """
 from __future__ import absolute_import, division, print_function
 
 import rkv
-from rkv import (
-    Backend,
-    KeyNotFound,
-    PythonBackend,
-    Rkv,
-    RkvError,
-    make_backend,
-)
 
 
 def test_version_is_string():
     assert isinstance(rkv.__version__, str)
-    assert rkv.__version__  # 非空
+    assert rkv.__version__
 
 
 def test_public_api_exports():
-    for name in ("Backend", "KeyNotFound", "PythonBackend", "Rkv",
-                 "RkvError", "make_backend", "__version__"):
+    for name in ("__version__", "VideoCapture", "MediaDevice",
+                 "MediaEntity", "MediaLink", "MediaPad"):
         assert hasattr(rkv, name), "rkv.{0} missing".format(name)
 
 
-def test_python_backend_basic():
-    b = PythonBackend()
-    b.set("a", "1")
-    b.set("b", "2")
-    assert b.get("a") == "1"
-    assert sorted(b.keys()) == ["a", "b"]
-    b.delete("a")
-    assert "a" not in b.keys()
-
-
-def test_python_backend_missing_key():
-    b = PythonBackend()
-    try:
-        b.get("nope")
-    except KeyNotFound:
-        return
-    assert False, "expected KeyNotFound"
-
-
-def test_rkv_context_manager_uses_python_backend():
-    # 没有 .so 时会自动 fallback 到 PythonBackend
-    db = Rkv.open(prefer="python")
-    try:
-        db.set("hello", "world")
-        assert db.get("hello") == "world"
-    finally:
-        db.close()
-
-
-def test_rkv_closed_raises():
-    db = Rkv.open(prefer="python")
-    db.close()
-    try:
-        db.set("x", "y")
-    except RkvError:
-        return
-    assert False, "expected RkvError after close"
-
-
-def test_make_backend_returns_a_backend():
-    backend = make_backend(prefer="python")
-    assert isinstance(backend, Backend)
+def test_conditional_symbols_are_either_class_or_none():
+    # ``VideoCapture`` 和 ``MediaDevice`` 在 native 缺失 / media-ctl 缺失时
+    # 是 None，否则是真类。两者都属预期。
+    assert rkv.VideoCapture is None or isinstance(rkv.VideoCapture, type)
+    assert rkv.MediaDevice is None or isinstance(rkv.MediaDevice, type)

@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyrkv"
-version = "0.1.0"
-description = "Python toolkit for the rkv key-value store and Rockchip MPP/RGA video decoder"
+version = "0.1.1"
+description = "Python bindings for Rockchip MPP / RGA2 / V4L2: hardware video decode and 2D acceleration"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "pyrkv maintainers"},
 ]
-keywords = ["rkv", "key-value", "storage", "rockchip", "mpp", "rga", "video", "decoder"]
+keywords = ["rkv", "rockchip", "mpp", "rga", "video", "decoder", "v4l2"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -23,11 +23,10 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Topic :: Database",
     "Topic :: Multimedia :: Video",
 ]
 # 第三方 Python 依赖。VideoCapture 路径（av/cv2/numpy/v4l2）只会在显式
-# import rkv.video 时触发；纯 KV 用户（只用 Rkv）不会强制装这些。
+# import rkv.video / rkv.media 时触发；纯 import rkv 不会强制装这些。
 dependencies = [
     "av>=10.0",
     "opencv-python>=4.5",
@@ -47,8 +46,8 @@ Homepage = "https://example.com/pyrkv"
 Issues = "https://example.com/pyrkv/issues"
 
 # ---------------------------------------------------------------------------
-# setuptools 配置：纯 Python 包。native 库（librkv / librockchip_mpp /
-# librga）**不**随 wheel 发布，必须由用户在系统层面安装，由 ctypes 通过
+# setuptools 配置：纯 Python 包。native 库（librockchip_mpp / librga）
+# **不**随 wheel 发布，必须由用户在系统层面安装，由 ctypes 通过
 # ldconfig / /usr/lib/... 加载。
 # ---------------------------------------------------------------------------
 [tool.setuptools]
