@@ -3,15 +3,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# 二进制：默认忽略，但 native/ 和 src/rkv/_native/ 下要随包发布的 .so 用白名单放回
+# 二进制：本仓库不发布 .so；任何 .so 一律忽略。
 *.so
 *.so.*
 *.dylib
 *.dll
-!native/*.so
-!native/*.so.*
-!src/rkv/_native/*.so
-!src/rkv/_native/*.so.*
 
 # 打包产物
 build/
@@ -38,8 +34,3 @@ env/
 *.swp
 *.swo
 .DS_Store
-
-# native 构建产物（按需保留）
-native/build/
-native/target/
-native/cmake-build-*/

@@ -16,17 +16,26 @@ pyrkv/
 │       ├── __init__.py     # 公开 API
 │       ├── _version.py
 │       ├── core.py         # 纯 Python 主逻辑
-│       ├── _native.py      # 加载 native/ 下的 .so
+│       ├── _native.py      # librkv.so 系统加载器
+│       ├── mpp.py          # librockchip_mpp.so 系统加载器
+│       ├── rga.py          # librga.so 系统加载器
+│       ├── video.py        # 视频解码上层（依赖 mpp + rga）
+│       ├── media.py        # media-ctl 解析（依赖 v4l2）
+│       ├── v4l2.py         # v4l2 helpers
 │       ├── rkv.pyi         # 类型 stub
 │       └── py.typed        # PEP 561 类型标记
-├── native/                 # 预编译的 .so 放在这里
-│   └── README.md
 ├── samples/                # 用法示例
 │   └── README.md
 ├── tests/                  # pytest 测试
 │   └── test_smoke.py
 └── docs/
 ```
+
+> **native 库不在仓库里** —— `librkv.so` / `librockchip_mpp.so.0` / `librga.so.2`
+> 必须由用户在系统层面安装（apt / dnf / 预编译 deb）。`rkv` 通过
+> `ctypes.util.find_library` + `dlopen` 在系统路径里查找它们；
+> 找不到时分别抛 `RuntimeError` / `OSError`，由 `make_backend()` /
+> `__init__.py` 的兜底逻辑降级，保证 `import rkv` 在开发机上不会崩。
 
 ## 安装
 

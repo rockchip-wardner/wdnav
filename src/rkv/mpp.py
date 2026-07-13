@@ -14,12 +14,15 @@ symbols exercised by the simple-decoder loop are bound:
 Anything encoder/ISP related is not bound — call sites for that path should
 go straight to ``_lib`` if needed.
 
-The library is searched in this order:
+The library is **not** bundled with this package. It must be installed
+system-wide (apt / dnf / prebuilt deb). Loading order:
 
-    1. ``rkv/_native/librockchip_mpp.so.0``    (vendored copy inside the installed wheel)
-    2. ``<repo>/native/librockchip_mpp.so.0``  (vendored copy in the source tree)
-    3. ``/usr/lib/aarch64-linux-gnu/librockchip_mpp.so.0``    (system install)
-    4. ``ctypes.util.find_library("rockchip_mpp")``           (fallback)
+    1. ``/usr/lib/aarch64-linux-gnu/librockchip_mpp.so.0``   (Debian multiarch)
+    2. ``ctypes.CDLL("rockchip_mpp", mode=RTLD_GLOBAL)``     (ldconfig fallback)
+
+If neither succeeds, :func:`_load_library` raises :class:`OSError` and
+:mod:`rkv` ``import``'s :class:`VideoCapture` becomes ``None`` (see
+:mod:`rkv.__init__`).
 """
 
 from __future__ import annotations
@@ -48,15 +51,9 @@ from typing import Optional
 # Library loading
 # ---------------------------------------------------------------------------
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-
 _LIBS_TO_TRY = (
-    # 1) installed wheel: rkv/_native/librockchip_mpp.so.0
-    os.path.join(_HERE, "_native", "librockchip_mpp.so.0"),
-    # 2) editable / source tree: <repo>/native/librockchip_mpp.so.0
-    #    src/rkv/mpp.py -> ../../../native/librockchip_mpp.so.0
-    os.path.normpath(os.path.join(_HERE, "..", "..", "native", "librockchip_mpp.so.0")),
-    # 3) system install
+    # 系统安装（Debian multiarch 路径）。如果用户把 .so 装到了别的地方，
+    # 由下面 CTYPES.CDLL("rockchip_mpp", ...) 通过 ldconfig 兜底。
     "/usr/lib/aarch64-linux-gnu/librockchip_mpp.so.0",
 )
 
@@ -70,15 +67,16 @@ def _load_library():
             except OSError as e:
                 last_err = e
                 continue
-    # Fall back to whatever ldconfig knows about.
+    # 兜底：让 dlopen 走 LD_LIBRARY_PATH / /etc/ld.so.cache。
     try:
         return ctypes.CDLL("rockchip_mpp", mode=ctypes.RTLD_GLOBAL)
     except OSError as e:
         raise OSError(
-            "Could not load librockchip_mpp.so.0. Tried: "
-            + ", ".join(_LIBS_TO_TRY)
-            + ". Last error: "
-            + repr(last_err or e)
+            "Could not load librockchip_mpp.so.0 from system paths. "
+            "Install librockchip-mpp system-wide (e.g. apt install "
+            "librockchip-mpp1) or place librockchip_mpp.so.0 under "
+            "/usr/lib/aarch64-linux-gnu/ and run `ldconfig`. "
+            "Last error: " + repr(last_err or e)
         )
 
 

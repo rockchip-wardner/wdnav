@@ -35,7 +35,14 @@ import av
 import cv2
 import numpy as np
 
-from . import v4l2 as _v4l2_mod
+# Note: ``rkv.v4l2`` (the upstream ``v4l2`` package) is **only** needed when
+# opening a ``/dev/video*`` capture node. Importing it eagerly forces every
+# VideoCapture() call — including the common file/URL path — to pay the cost
+# of loading it, and triggers spurious import errors on environments where
+# the kernel-headers shim is broken (notably the Python 3.11 build, where
+# ``v4l2.py`` uses ``range(1, 9) + [0x80]`` for enum assignment). We defer the
+# import to ``_init_v4l2`` so file decoding never touches it.
+v4l2 = None  # populated lazily on first /dev/video* open
 
 from . import rga
 from .mpp import (
@@ -332,6 +339,10 @@ class VideoCapture:
         ``"yuyv"``). ``v4l2_size`` and ``v4l2_framerate`` default to
         ``None`` (= keep the driver's current setting).
         """
+        global v4l2  # noqa: PLW0603 — module-level lazy import binding
+        if v4l2 is None:
+            from . import v4l2 as _v4l2_mod
+            v4l2 = _v4l2_mod
         if not input_format:
             input_format = "nv12"   # most ISP outputs default to NV12
         if not size:
@@ -342,7 +353,7 @@ class VideoCapture:
         self._v4l2_size = size
         self._v4l2_framerate = framerate
 
-        self._v4l2_cap = _v4l2_mod.V4L2Capture(
+        self._v4l2_cap = v4l2.V4L2Capture(
             path,
             width=size[0],
             height=size[1],
@@ -527,7 +538,7 @@ class VideoCapture:
 
     def _v4l2_to_bgr(
         self,
-        buf: "_v4l2_mod.V4L2BufferInfo",
+        buf: "v4l2.V4L2BufferInfo",
         out_w: Optional[int] = None,
         out_h: Optional[int] = None,
         out_fmt: Optional[str] = None,
@@ -619,7 +630,7 @@ class VideoCapture:
 
     def _v4l2_rga_to_bgr(
         self,
-        buf: "_v4l2_mod.V4L2BufferInfo",
+        buf: "v4l2.V4L2BufferInfo",
         out_w: Optional[int] = None,
         out_h: Optional[int] = None,
         out_fmt: Optional[str] = None,

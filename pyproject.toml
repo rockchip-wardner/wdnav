@@ -47,7 +47,9 @@ Homepage = "https://example.com/pyrkv"
 Issues = "https://example.com/pyrkv/issues"
 
 # ---------------------------------------------------------------------------
-# setuptools 配置：src layout，并打包 native/ 下的 .so 进 wheel
+# setuptools 配置：纯 Python 包。native 库（librkv / librockchip_mpp /
+# librga）**不**随 wheel 发布，必须由用户在系统层面安装，由 ctypes 通过
+# ldconfig / /usr/lib/... 加载。
 # ---------------------------------------------------------------------------
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -56,14 +58,8 @@ package-dir = {"" = "src"}
 where = ["src"]
 include = ["rkv*"]
 
-# 把 src/rkv/_native/ 下的 .so 符号链接（指向 native/）打进 wheel 的 rkv/_native/
 [tool.setuptools.package-data]
 rkv = [
-    "_native/*.so",
-    "_native/*.so.*",
-    "_native/*.so.*.*",
-    "_native/*.dylib",
-    "_native/*.dll",
     "py.typed",
 ]
 

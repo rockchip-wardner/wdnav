@@ -4,14 +4,6 @@ include LICENSE
 include MANIFEST.in
 include pyproject.toml
 
-# 把 native/ 下的 .so 一起打包进 sdist
-recursive-include native *.so *.so.* *.dylib *.dll
-recursive-include native *.h *.c *.cc *.cpp *.rs
-
-# src/rkv/_native/ 下的 .so 符号链接指向 native/，sdist 也带上
-include src/rkv/_native/*.so
-include src/rkv/_native/*.so.*
-
 # 类型 stub
 include src/rkv/py.typed
 include src/rkv/*.pyi

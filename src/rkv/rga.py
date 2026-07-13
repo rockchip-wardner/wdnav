@@ -5,21 +5,24 @@ This module binds the **im2d C entry points** (``imcvtcolor_t``,
 ``querystring``, ``imcheck``) that ship in ``/usr/include/rga/`` and
 are documented under ``im2d.h`` / ``im2d_single.h`` / ``im2d_common.h``.
 
+The library is **not** bundled with this package. It must be installed
+system-wide; see :func:`_load_library` for the lookup order. If neither
+``/usr/lib/aarch64-linux-gnu/librga.so.2`` nor an ldconfig-registered
+``librga`` resolves, the import of :mod:`rkv` ``VideoCapture`` falls
+back to ``None`` (see :mod:`rkv.__init__`).
+
 Why im2d (not the older ``c_RkRga*`` API):
   - **Auto-dispatches between RGA2 and RGA3** at runtime. The im2d
     context (``g_im2d_context``) probes the kernel at load time and
     routes every call to whichever core is available. RGA2 (legacy
     VOP, RK356x and earlier) and RGA3 (the new multi-core engine on
-    RK3588 / RK3568 / RK3562 etc.) are picked transparently — a
-    wheel built for RK356x still works unmodified on RK3588.
+    RK3588 / RK3568 / RK3562 etc.) are picked transparently.
 
   - **Handle-based buffer management.** Importing a buffer (VA, fd
     or physical) returns a stable ``rga_buffer_handle_t``; the
     library caches its stride / format / size and reuses the mapping
     across calls. The old direct-``wrapbuffer_virtualaddr_t`` path
-    bypasses that cache and can miss driver-side stride alignment
-    (which is exactly the ``status=-1`` we kept hitting on this
-    RGA2 build for some 1366x768 sources).
+    bypasses that cache and can miss driver-side stride alignment.
 
   - **``querystring``** reports the active backend, supported
     formats, and resolution limits at runtime, so we can fail
@@ -67,15 +70,9 @@ from typing import Optional
 # Library loading
 # ---------------------------------------------------------------------------
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-
 _LIBS_TO_TRY = (
-    # 1) installed wheel: rkv/_native/librga.so.2
-    os.path.join(_HERE, "_native", "librga.so.2"),
-    # 2) editable / source tree: <repo>/native/librga.so.2
-    #    src/rkv/rga.py -> ../../../native/librga.so.2
-    os.path.normpath(os.path.join(_HERE, "..", "..", "native", "librga.so.2")),
-    # 3) system install
+    # 系统安装（Debian multiarch 路径）。如果用户把 .so 装到了别的地方，
+    # 由下面 CTYPES.CDLL("rga", ...) 通过 ldconfig 兜底。
     "/usr/lib/aarch64-linux-gnu/librga.so.2",
 )
 
@@ -89,14 +86,16 @@ def _load_library():
             except OSError as e:
                 last_err = e
                 continue
+    # 兜底：让 dlopen 走 LD_LIBRARY_PATH / /etc/ld.so.cache。
     try:
         return ctypes.CDLL("rga", mode=ctypes.RTLD_GLOBAL)
     except OSError as e:
         raise OSError(
-            "Could not load librga.so.2 (im2d). Tried: "
-            + ", ".join(_LIBS_TO_TRY)
-            + ". Last error: "
-            + repr(last_err or e)
+            "Could not load librga.so.2 (im2d) from system paths. "
+            "Install librockchip-rga system-wide (e.g. apt install "
+            "librga2) or place librga.so.2 under "
+            "/usr/lib/aarch64-linux-gnu/ and run `ldconfig`. "
+            "Last error: " + repr(last_err or e)
         )
 
 

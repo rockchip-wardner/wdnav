@@ -60,7 +60,7 @@ class PythonBackend(Backend):
 
 
 class NativeBackend(Backend):
-    """通过 ctypes 调用 native/ 下的 librkv.so。"""
+    """通过 ctypes 调用系统安装的 librkv.so（必须由用户在系统层面装好）。"""
 
     def __init__(self):
         self._lib = _native.get_native()
