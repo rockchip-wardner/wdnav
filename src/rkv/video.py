@@ -405,6 +405,8 @@ class VideoCapture:
         w: Optional[int] = None,
         h: Optional[int] = None,
         fmt: Optional[str] = None,
+        *,
+        to: "Optional[Surface]" = None,
     ) -> Tuple[bool, Optional[np.ndarray]]:
         """Pull the next decoded frame from the source.
 
@@ -427,9 +429,20 @@ class VideoCapture:
         back at the source's native size and BGR — i.e. the
         constructor-time ``output_size`` is honoured but otherwise no
         per-call work happens.
+
+        ``to`` is an optional :class:`rkv.Surface` from a
+        :class:`rkv.SurfaceFlinger`. When set, the decoded frame's
+        DMA-BUF fd is handed to the surface directly — the frame never
+        touches the CPU and ``read()`` returns ``(True, None)``. The
+        :class:`rkv.SurfaceFlinger` composites it asynchronously on its
+        GL worker thread; call :meth:`SurfaceFlinger.read` to retrieve
+        the composited result.
         """
         if not self._opened or self._eof:
             return False, None
+
+        if to is not None:
+            return self._read_to_surface(to)
 
         # Resolve per-call overrides. An empty string is treated like None
         # so callers can pass through variables without an explicit None check.
@@ -482,6 +495,81 @@ class VideoCapture:
 
         self._eof = True
         return False, None
+
+    def _read_to_surface(
+        self, to: "Surface",
+    ) -> Tuple[bool, Optional[np.ndarray]]:
+        """Decode-loop variant that hands every frame's DMA-BUF fd to ``to``.
+
+        Mirrors the structure of :meth:`read` (PyAV demux → MPP send → recv
+        → surface) but skips RGA and CPU work entirely. Returns ``(True, None)``
+        when a frame was posted, ``(False, None)`` at EOF / failure.
+        """
+        if getattr(self, "_is_v4l2", False):
+            return self._read_v4l2_to_surface(to)
+
+        for raw_packet in self._container.demux(self._stream):
+            data = bytes(raw_packet)
+            if not data:
+                continue
+            self._send(
+                data, pts=int(raw_packet.pts or raw_packet.dts or 0),
+                out_w=None, out_h=None, out_fmt=None,
+            )
+            if self._drain_one_to_surface(
+                to, timeout_ms=_DRAIN_TIMEOUT_MS,
+            ):
+                return True, None
+
+        if self._is_live:
+            import time as _t
+            _t.sleep(0.005)
+            return self._read_to_surface(to)
+
+        self._decoder.send_packet(b"", pts=0, eos=True)
+        idle = 0
+        while idle < 10:
+            if self._drain_one_to_surface(to, timeout_ms=50):
+                return True, None
+            idle += 1
+        self._eof = True
+        return False, None
+
+    def _drain_one_to_surface(
+        self, to: "Surface", timeout_ms: int,
+    ) -> bool:
+        """Pop one decoded frame and hand its fd to ``to``. Returns True on success."""
+        frame = self._decoder.recv_frame(timeout_ms=timeout_ms)
+        if frame is None:
+            return False
+        try:
+            if frame.fd is None or frame.fd < 0:
+                return False
+            stride = frame.hor_stride or frame.width
+            to.post_fd(frame.fd, pts=int(frame.pts or 0), stride=stride)
+        finally:
+            self._decoder.release_frame(frame)
+        self.frame_pos += 1
+        return True
+
+    def _read_v4l2_to_surface(
+        self, to: "Surface",
+    ) -> Tuple[bool, Optional[np.ndarray]]:
+        """V4L2 variant of the to= path: post the V4L2 plane-0 fd to ``to``."""
+        cap = self._v4l2_cap
+        if cap is None:
+            return False, None
+        buf = cap.dequeue(timeout_s=2.0)
+        if buf is None:
+            return False, None
+        try:
+            if not buf.plane_fds or buf.plane_fds[0] < 0:
+                return False, None
+            to.post_fd(buf.plane_fds[0], pts=int(getattr(buf, "sequence", 0) or 0))
+        finally:
+            cap.requeue(buf)
+        self.frame_pos += 1
+        return True, None
 
     def release(self) -> None:
         if not self._opened:
