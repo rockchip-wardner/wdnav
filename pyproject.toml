@@ -25,11 +25,10 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Multimedia :: Video",
 ]
-# 第三方 Python 依赖。VideoCapture 路径（av/cv2/numpy/v4l2）只会在显式
+# 第三方 Python 依赖。VideoCapture 路径（av/numpy/v4l2）只会在显式
 # import rkv.video / rkv.media 时触发；纯 import rkv 不会强制装这些。
 dependencies = [
     "av>=10.0",
-    "opencv-python>=4.5",
     "numpy>=1.20",
     "v4l2>=0.2",
 ]

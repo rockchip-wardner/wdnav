@@ -1,7 +1,9 @@
 # pyrkv
 
 > 纯 Python 实现的 rockchip 硬件编解码和硬件2D加速器封装包，封装了libmpp和librga的python ctypes实现，
-> 使用pyav和python-v4l2来实现前端协议和文件格式解析以及demux，后端对接vpu与rga，兼容cv2接口，可直接使用cv2做后续算法与显示。
+> 使用pyav和python-v4l2来实现前端协议和文件格式解析以及demux，后端对接vpu与rga。
+> `VideoCapture.read()` 返回与 OpenCV 兼容的 `(H, W, 3)` ndarray，可直接交给 PIL /
+> OpenCV / numpy 等下游算法使用；像素格式转换与缩放全部走 RGA2，库本体不再依赖 opencv-python。
 
 ## 项目结构
 
@@ -56,16 +58,19 @@ python -m build
 
 ```python
 import rkv
-cap = rkv.VideoCapture(path)  # 这里path可以是本地文件也可以是网络流，也可以是v4l2设备
-ret, frame = cap.read()  # 读取一帧，与cv2的用法是一致的，返回的格式也是一致的
-ret, frame = cap.read(w, h, fmt)  # 这是cv2没有的接口，使用RGA对输出的格式分辨率进行的指定转换 
+cap = rkv.VideoCapture(path)  # path 可以是本地文件、网络流或 /dev/videoX
+ret, frame = cap.read()  # 与 cv2 用法一致；BGR (H, W, 3) ndarray
+ret, frame = cap.read(w, h, fmt)  # 这是 cv2 没有的接口，使用 RGA 进行指定分辨率/像素格式的转换
 
 # 其他详细示例见 samples/ 目录
 ```
 
+`samples/*.py` 默认使用 cv2 做显示；要跑无显示版本，设 `DISPLAY=0`，或在没装
+`opencv-python` 的环境直接跑——脚本会自动降级为每 30 帧打印一次的 headless 循环。
+
 ## 兼容性
 
-- 目标兼容 Python 3.x 全系列（`requires-python = ">=3.0"`）
+- 目标兼容 Python 3.10+（`requires-python = ">=3.10"`）
 - 平台：当前主要面向 Linux（.so）
 
 ## 开发

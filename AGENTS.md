@@ -13,7 +13,7 @@ in-tree `.venv/`. As shipped, `.venv/` only has `build` / `pip` / `setuptools`
 is mandatory before any test or import runs.
 
 ```bash
-# 1. one-time setup (installs rkv + pytest/build/twine + av/cv2/numpy/v4l2)
+# 1. one-time setup (installs rkv + pytest/build/twine + av/numpy/v4l2)
 .venv/bin/pip install -e ".[dev]"
 
 # 2. tests (import-only smoke, never needs librockchip_mpp / librga)
@@ -39,6 +39,11 @@ Do **not** invoke `ruff` / `flake8` / `black` / `mypy` — none are configured.
   become `None` when native libs / `media-ctl` are missing — any change that
   turns that into an unconditional import or eager ctypes call will break
   `import rkv` on non-Rockchip / developer machines. Preserve this fallback.
+- **`import rkv.video` no longer needs opencv-python.** All pixel-format
+  conversion goes through RGA (`src/rkv/video.py:_v4l2_rga_to_bgr`,
+  `_rga_to_bgr`, `_rga_nv12_to`). When RGA cannot accept a format / size
+  combination the helper raises `RuntimeError`; there is no software
+  fallback. Adding one would re-introduce the cv2 dependency.
 - **No `.so` files in the repo.** `librockchip_mpp.so.0` / `librga.so.2` are
   loaded **only** from the system (Debian multiarch path first, then
   `ctypes.util.find_library` / `dlopen` via ldconfig). If the library isn't

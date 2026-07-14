@@ -32,7 +32,8 @@ Typical usage::
                 break
             # buf.plane_arrays[0] is an (H, W) uint8 view of plane 0 (Y)
             # For NV12 the second plane (UV) is buf.plane_arrays[1]
-            cv2.cvtColor(buf.combined_nv12(), cv2.COLOR_YUV2BGR_NV12)
+            # Hand the buffer to RGA via the fd (rga.wrap_fd(...)) — opencv
+            # is no longer used; RGA is the only conversion backend.
             cap.requeue(buf)
     finally:
         cap.close()

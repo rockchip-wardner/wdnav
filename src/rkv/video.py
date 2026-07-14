@@ -1,14 +1,20 @@
-"""VideoCapture — a thin OpenCV-style wrapper around the MPP hardware decoder.
+"""VideoCapture — a hardware-accelerated wrapper around the MPP decoder and
+V4L2 capture pipeline.
 
-Designed to mirror ``cv2.VideoCapture`` so existing OpenCV pipelines can be
-retargeted at the Rockchip VPU with a one-line import swap. The heavy
-lifting (PyAV demux, AVCC→Annex B, SPS/PPS injection, NV12→BGR) lives in
-this module; the underlying ctypes binding to ``librockchip_mpp.so`` is
-``rkv.mpp``.
+Designed to mirror the OpenCV ``VideoCapture`` calling convention so existing
+OpenCV-style pipelines can be retargeted at the Rockchip VPU with a one-line
+import swap. The heavy lifting (PyAV demux, AVCC→Annex B, SPS/PPS injection,
+NV12/YUYV → BGR via RGA2) lives in this module; the underlying ctypes
+binding to ``librockchip_mpp.so`` is ``rkv.mpp``.
+
+Every pixel-format conversion runs through RGA2 (``librockchip_mpp`` cannot
+do colour conversion on its own). If the requested format / size combo is
+not accepted by the active RGA backend, ``VideoCapture.read`` raises
+``RuntimeError`` rather than silently degrading.
 
 Typical usage:
 
-    import cv2
+    import numpy as np
     from rkv import VideoCapture
 
     cap = VideoCapture("bus.mp4")
@@ -16,9 +22,8 @@ Typical usage:
         ret, frame = cap.read()
         if not ret:
             break
-        cv2.imshow("video", frame)
-        if cv2.waitKey(25) & 0xFF == ord("q"):
-            break
+        # frame is a (H, W, 3) uint8 ndarray — feed to OpenCV / PIL / your
+        # own pipeline as needed.
     cap.release()
 
 The class is also a context manager, so a ``with`` block guarantees the
@@ -32,7 +37,6 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import av
-import cv2
 import numpy as np
 
 # Note: ``rkv.v4l2`` (the upstream ``v4l2`` package) is **only** needed when
@@ -71,10 +75,13 @@ _MPP_TO_RGA_FMT = {
     5: rga.RgaFormat.YCrCb_420_SP,
 }
 _MPP_TO_RGA_NAME = {0: "NV12", 4: "I420", 5: "NV21"}
-# Same set as above — the formats _nv12_to_bgr() knows how to cvtColor.
-# (Was referenced but never defined in the upstream source; restoring it
-# here so the cv2 fallback path actually runs.)
-_FRAME_BGR_FORMATS = frozenset(_MPP_TO_RGA_FMT.keys())
+_V4L2_INPUT_TO_RGA = {
+    "NV12": rga.RgaFormat.YCbCr_420_SP,
+    "NV21": rga.RgaFormat.YCrCb_420_SP,
+    "YUYV": rga.RgaFormat.YUYV_422,
+    "UYVY": rga.RgaFormat.UYVY_422,
+    "YUV420": rga.RgaFormat.YCbCr_420_P,
+}
 
 
 # Map the short names users pass to ``read(fmt=...)`` to the corresponding
@@ -197,16 +204,8 @@ class VideoCapture:
         that might be unreachable; ``None`` lets PyAV block indefinitely.
     output_size:
         Optional ``(width, height)`` to scale every decoded frame to.
-        For file sources the resize is done in hardware by the 2D RGA
-        engine (RGA2) on the same SOC as the VPU; for V4L2 sources it's
-        done by libswscale (still single-pass, software). ``None`` keeps
-        the native frame size.
-    use_rga:
-        When ``True`` (default), hardware-color-convert NV12 → BGR via
-        RGA2 (file sources only). Set ``False`` to fall back to
-        ``cv2.cvtColor`` — useful when RGA isn't available, or when
-        reproducing a bug that doesn't appear in the RGA path. Ignored
-        for V4L2 sources (they always go through libswscale).
+        Resize and pixel-format conversion run in hardware through RGA2;
+        unsupported format / size combinations raise ``RuntimeError``.
     v4l2_input_format:
         V4L2-only. Pixel format to request from the sensor / ISP —
         e.g. ``"nv12"``, ``"yuyv422"``, ``"mjpeg"``. ``None`` lets the
@@ -230,7 +229,6 @@ class VideoCapture:
         path: str | Path,
         timeout: Optional[float] = 10.0,
         output_size: Optional[Tuple[int, int]] = None,
-        use_rga: bool = True,
         *,
         v4l2_input_format: Optional[str] = None,
         v4l2_size: Optional[Tuple[int, int]] = None,
@@ -302,7 +300,6 @@ class VideoCapture:
         # VPU, so feeding it the MPP frame's virtual address is zero-copy.
         # The destination BGR buffer is allocated once and grown lazily.
         self._output_size: Optional[Tuple[int, int]] = output_size
-        self._use_rga: bool = use_rga
         # Cached RGA dst buffer (BGR888). Keyed on (w, h); rebuilt when
         # the effective output dimensions change.
         self._bgr_buf_key: Optional[Tuple[int, int]] = None
@@ -369,11 +366,11 @@ class VideoCapture:
         self._is_live: bool = True
         self._path_str: str = path
 
-        # The V4L2 buffer queue yields raw NV12/YUYV/etc. — we do the
-        # BGR conversion in _v4l2_to_bgr via cv2.
+        # The V4L2 buffer queue yields raw NV12/YUYV/etc.; RGA performs
+        # resize and colour conversion from the exported DMA-BUF.
         self._output_size: Optional[Tuple[int, int]] = output_size
-        self._use_rga: bool = False
         self._decoder = None
+        self._container = None
         self._codec_name: Optional[str] = None
         self._sps_pps = b""
         self._sent_extradata = True
@@ -517,9 +514,9 @@ class VideoCapture:
 
         Loops forever for live sources (cameras have no EOF); the caller
         must call :meth:`release` to stop. The per-call ``out_w`` /
-        ``out_h`` / ``out_fmt`` overrides are forwarded to the conversion
-        path (RGA when available, cv2 otherwise) so the caller can ask
-        for a different size or pixel format frame-by-frame.
+        ``out_h`` / ``out_fmt`` overrides are forwarded to RGA so the
+        caller can ask for a different size or pixel format frame-by-frame.
+        Raises ``RuntimeError`` if RGA cannot service the request.
         """
         cap = self._v4l2_cap
         if cap is None:
@@ -542,89 +539,21 @@ class VideoCapture:
         out_w: Optional[int] = None,
         out_h: Optional[int] = None,
         out_fmt: Optional[str] = None,
-    ) -> Optional[np.ndarray]:
-        """Convert a V4L2 raw buffer into a contiguous BGR ndarray.
+    ) -> np.ndarray:
+        """Convert a V4L2 raw buffer into a contiguous ndarray via RGA2.
 
-        Two paths, picked per call:
-
-        - **RGA zero-copy** (default for NV12/NV21 with a valid DMA-BUF fd):
-          ``rga.wrap_nv12_fd`` + ``rga.cvtcolor`` / ``rga.resize`` against the
-          destination mmap buffer. Honours per-call ``out_w``/``out_h``/``out_fmt``
-          (resize + pixel format conversion in one hardware pass). Falls
-          back to cv2 if RGA rejects the configuration.
-        - **cv2 fallback** (for YUYV / UYVY / formats RGA doesn't understand,
-          or when the driver didn't give us an EXPBUF fd). Uses the
-          constructor's ``output_size`` for resize if set; per-call
-          ``out_w``/``out_h`` are also honoured.
-
-        In both paths the returned ndarray borrows the destination buffer
-        memory, so callers who need to keep a frame past the next read()
-        should ``.copy()`` it.
+        Supported V4L2 source formats: NV12, NV21, I420, YUYV, UYVY.
+        Anything else raises. Resize and per-call ``out_fmt`` /
+        ``out_w`` / ``out_h`` overrides are honoured; on RGA rejection
+        the exception propagates.
         """
         fmt = buf.pixel_format.upper()
-
-        # -------- RGA fast path: NV12 / NV21 with DMA-BUF fd --------
-        if (
-            self._use_rga
-            and fmt in ("NV12", "NV21")
-            and buf.plane_fds
-            and buf.plane_fds[0] >= 0
-            and len(buf.plane_arrays) >= 2
-        ):
-            bgr = self._v4l2_rga_to_bgr(buf, out_w, out_h, out_fmt)
-            if bgr is not None:
-                return bgr
-            # RGA rejected the configuration — fall through to cv2.
-
-        # -------- cv2 fallback --------
-        if fmt == "NV12":
-            if len(buf.plane_arrays) != 2:
-                return None
-            y = buf.plane_arrays[0].reshape(buf.height, buf.width)
-            uv = buf.plane_arrays[1].reshape(buf.height // 2, buf.width)
-            h2 = buf.height * 3 // 2
-            yuv = np.empty(h2 * buf.width, dtype=np.uint8)
-            yuv[: buf.height * buf.width] = y.reshape(-1)
-            yuv[buf.height * buf.width:] = uv.reshape(-1)
-            yuv = yuv.reshape(h2, buf.width)
-        elif fmt == "NV21":
-            if len(buf.plane_arrays) != 2:
-                return None
-            # NV21 = same as NV12 but UV order swapped in the chroma plane.
-            # cv2.COLOR_YUV2BGR_NV21 handles the swap for us if we pass the
-            # same stacked buffer shape.
-            y = buf.plane_arrays[0].reshape(buf.height, buf.width)
-            uv = buf.plane_arrays[1].reshape(buf.height // 2, buf.width)
-            h2 = buf.height * 3 // 2
-            yuv = np.empty(h2 * buf.width, dtype=np.uint8)
-            yuv[: buf.height * buf.width] = y.reshape(-1)
-            yuv[buf.height * buf.width:] = uv.reshape(-1)
-            yuv = yuv.reshape(h2, buf.width)
-        elif fmt == "YUYV":
-            raw = buf.plane_arrays[0]
-            yuv = raw.reshape(buf.height, buf.width, 2)[..., 0]
-            return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_YUYV)
-        elif fmt == "UYVY":
-            raw = buf.plane_arrays[0]
-            yuv = raw.reshape(buf.height, buf.width, 2)[..., 1]
-            return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_UYVY)
-        else:
-            return None
-
-        if fmt in ("NV12", "NV21"):
-            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12 if fmt == "NV12" else cv2.COLOR_YUV2BGR_NV21)
-
-        # Honour the same override chain as the RGA path.
-        target_w = out_w if out_w else (self._output_size[0] if self._output_size else buf.width)
-        target_h = out_h if out_h else (self._output_size[1] if self._output_size else buf.height)
-        if (target_w, target_h) != (buf.width, buf.height):
-            bgr = cv2.resize(bgr, (target_w, target_h))
-
-        # cv2 can produce any 8-bit pixel format via cvtColor, but we
-        # only natively return BGR / RGB shapes. Other formats would
-        # need extra channels (BGRA/RGBA) — not implemented in the
-        # fallback path; caller should rely on RGA for those.
-        return bgr
+        if fmt not in _V4L2_INPUT_TO_RGA:
+            raise RuntimeError(
+                f"V4L2 pixel format {fmt!r} is not supported by RGA; "
+                f"supported: {sorted(_V4L2_INPUT_TO_RGA)}"
+            )
+        return self._v4l2_rga_to_bgr(buf, out_w, out_h, out_fmt)
 
     # -- RGA zero-copy helpers (shared with the MPP path) --------------------
 
@@ -634,76 +563,51 @@ class VideoCapture:
         out_w: Optional[int] = None,
         out_h: Optional[int] = None,
         out_fmt: Optional[str] = None,
-    ) -> Optional[np.ndarray]:
-        """Hardware NV12/NV21 → output via RGA2 from a V4L2 DMA-BUF fd.
-
-        Mirrors ``_rga_to_bgr`` (the MPP path) but uses ``buf.plane_fds[0]``
-        (the DMA-BUF fd exported via VIDIOC_EXPBUF) instead of
-        ``frame.fd``. Honours per-call overrides in priority order:
-        ``out_w`` / ``out_h`` → constructor's ``output_size`` → source size.
-        Same chain applies to ``out_fmt`` (default BGR_888).
-
-        Resize and pixel-format conversion happen in the same hardware
-        pass when both ``out_w/out_h`` and ``out_fmt`` are provided.
-        """
-        from . import rga
-
-        if not buf.plane_fds or buf.plane_fds[0] < 0:
-            return None
-
+    ) -> np.ndarray:
+        """Convert a V4L2 DMA-BUF into the requested output through RGA2."""
         target_w = out_w if out_w else (self._output_size[0] if self._output_size else buf.width)
         target_h = out_h if out_h else (self._output_size[1] if self._output_size else buf.height)
-        rga_fmt, bpp, layout = _resolve_output_format(out_fmt)
-        # Same hardware-strategy as the MPP path: HWC dsts target BGR_888
-        # via RGA, then a cv2 step handles the channel swap / alpha.
-        if layout == "HWC":
-            hw_fmt = rga.RgaFormat.BGR_888
-            hw_bpp = 3
-            hw_layout = "HWC"
-        else:
-            hw_fmt = rga_fmt
-            hw_bpp = bpp
-            hw_layout = layout
-        try:
-            src = rga.wrap_nv12_fd(
-                buf.plane_fds[0], buf.width, buf.height,
-                hor_stride=buf.width, ver_stride=buf.height,
+        target_fmt, bpp, layout = _resolve_output_format(out_fmt)
+        input_fmt = _V4L2_INPUT_TO_RGA[buf.pixel_format.upper()]
+
+        if buf.plane_fds and buf.plane_fds[0] >= 0:
+            src = rga.wrap_fd(
+                buf.plane_fds[0], buf.width, buf.height, input_fmt,
+                wstride=buf.width, hstride=buf.height,
             )
-        except RuntimeError:
-            return None
+        elif buf.plane_arrays:
+            if len(buf.plane_arrays) == 1:
+                src_array = np.ascontiguousarray(buf.plane_arrays[0])
+            else:
+                src_array = np.concatenate(
+                    [np.asarray(plane).reshape(-1) for plane in buf.plane_arrays]
+                )
+            src = rga.wrap_virtual(
+                int(src_array.ctypes.data), buf.width, buf.height, input_fmt,
+                wstride=buf.width, hstride=buf.height,
+            )
+        else:
+            raise RuntimeError("V4L2 buffer has no DMA-BUF fd or virtual-address plane")
 
-        # Same 16-aligned dst-stride dance as the MPP path: RGA2
-        # rejects dst.wstride values that aren't multiples of 16
-        # for RGB-family output. Round up, allocate the buffer
-        # with the aligned width, and slice the result back to
-        # target_w before returning.
         rga_w = (target_w + 15) & ~15
-
-        buf_storage = self._ensure_bgr_buffer(rga_w, target_h, fmt=hw_fmt)
+        buf_storage = self._ensure_bgr_buffer(rga_w, target_h, fmt=target_fmt)
         dst = rga.wrap_virtual(
-            ctypes.addressof(buf_storage), rga_w, target_h, hw_fmt
+            ctypes.addressof(buf_storage), rga_w, target_h, target_fmt
         )
         try:
-            if (target_w, target_h) == (buf.width, buf.height) or hw_layout != "HWC":
+            if (target_w, target_h) == (buf.width, buf.height):
                 rga.cvtcolor(src, dst)
             else:
                 rga.resize(src, dst)
             rga.flush()
-        except RuntimeError:
-            return None
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"RGA cannot convert V4L2 {buf.pixel_format.upper()} "
+                f"{buf.width}x{buf.height} to {rga.format_name(target_fmt)} "
+                f"{target_w}x{target_h}: {e}"
+            ) from e
 
-        if layout == "HWC" and rga_fmt != rga.RgaFormat.BGR_888:
-            bgr_view = np.frombuffer(buf_storage, dtype=np.uint8).reshape(
-                target_h, rga_w, 3
-            )[:, :target_w]
-            if rga_fmt == rga.RgaFormat.RGB_888:
-                return cv2.cvtColor(bgr_view, cv2.COLOR_BGR2RGB)
-            if rga_fmt == rga.RgaFormat.BGRA_8888:
-                return cv2.cvtColor(bgr_view, cv2.COLOR_BGR2BGRA)
-            if rga_fmt == rga.RgaFormat.RGBA_8888:
-                return cv2.cvtColor(bgr_view, cv2.COLOR_BGR2RGBA)
-
-        out = _as_ndarray(buf_storage, rga_w, target_h, hw_bpp, hw_layout)
+        out = _as_ndarray(buf_storage, rga_w, target_h, bpp, layout)
         if rga_w != target_w:
             out = out[:, :target_w]
         return out
@@ -808,20 +712,18 @@ class VideoCapture:
         out_h: Optional[int] = None,
         out_fmt: Optional[str] = None,
     ) -> Optional[np.ndarray]:
-        """Run recv_frame once, convert NV12/NV21/I420 → output, release.
+        """Run recv_frame once, convert via RGA, release the MPP frame.
 
         ``out_w`` / ``out_h`` / ``out_fmt`` override the constructor-time
-        settings for this single frame. When all three are ``None`` we
-        behave as before (BGR at the source size).
+        settings for this single frame. When all three are ``None`` the
+        default BGR-at-source-size behaviour applies. Raises
+        ``RuntimeError`` if RGA cannot service the requested format.
         """
         frame = self._decoder.recv_frame(timeout_ms=timeout_ms)
         if frame is None:
             return None
         try:
-            if self._use_rga and frame.fmt in _MPP_TO_RGA_FMT:
-                bgr = self._rga_to_bgr(frame, out_w, out_h, out_fmt)
-            else:
-                bgr = _nv12_to_bgr(frame)
+            bgr = self._rga_to_bgr(frame, out_w, out_h, out_fmt)
         finally:
             self._decoder.release_frame(frame)
         if bgr is not None:
@@ -861,119 +763,26 @@ class VideoCapture:
         out_w: Optional[int] = None,
         out_h: Optional[int] = None,
         out_fmt: Optional[str] = None,
-    ) -> Optional[np.ndarray]:
-        """Convert ``frame`` to output via RGA2. Honors per-call overrides.
-
-        Strategy (in order of preference):
-          1. RGA writes the requested target format directly (NV12 /
-             NV21 / GRAY). Works on most RGA cores for BGR/RGB; tested
-             case-by-case below.
-          2. RGA writes BGR_888 (always supported, cheapest HWC) and
-             a single cv2.cvtColor post-step does the channel swap
-             (BGR→RGB) / alpha insertion (BGR→BGRA/RGBA).
-          3. If RGA fails outright, fall back to the cv2 NV12→BGR path
-             and apply the same cv2 post-step.
-
-        For YUV / GRAY targets with RGA unavailable, we re-use the
-        cv2 BGR result and convert via cv2 (BGR→NV12 / BGR→GRAY).
-        Slower but always works.
-        """
-        # Apply precedence: per-call > constructor > source size
+    ) -> np.ndarray:
+        """Convert an MPP frame directly to the requested output through RGA2."""
+        if frame.fmt not in _MPP_TO_RGA_FMT:
+            raise RuntimeError(
+                f"MPP frame format {frame.fmt} is not supported by RGA input; "
+                f"supported: {sorted(_MPP_TO_RGA_NAME.values())}"
+            )
         target_w = out_w if out_w else (self._output_size[0] if self._output_size else frame.width)
         target_h = out_h if out_h else (self._output_size[1] if self._output_size else frame.height)
-        rga_fmt, bpp, layout = _resolve_output_format(out_fmt)
-
-        # Strategy: try RGA all the way; fall back to cv2 only when RGA
-        # raises. RGA2 doesn't support every NV12→X conversion
-        # (e.g. NV12→BGRA fails on this machine's RGA2), so the
-        # exception path is real. On RGA3 (RK3588+) every conversion
-        # succeeds and the cv2 path is never taken.
-
-        # Step 1: try RGA NV12 → target format directly. RGA2_Enhance
-        # and RGA3 both support every HWC family (BGR_888, RGB_888,
-        # BGRA_8888, RGBA_8888), so on most callers this step
-        # produces the answer with no post-processing. rga.output_
-        # formats()'s printed list omits BGR_888 / BGRA_8888 even
-        # though the cores handle them, so don't trust that string
-        # as a capability check — try and see.
-        bgr_ndarray: Optional[np.ndarray] = None
-        rga_native_format = False
+        target_fmt, bpp, layout = _resolve_output_format(out_fmt)
         try:
-            bgr_ndarray = self._rga_nv12_to(
-                frame, target_w, target_h, rga_fmt, bpp, layout,
+            return self._rga_nv12_to(
+                frame, target_w, target_h, target_fmt, bpp, layout,
             )
-            rga_native_format = True
-        except RuntimeError:
-            bgr_ndarray = None
-
-        # Step 2: try RGA NV12 → BGR_888. Step 1 failed (usually
-        # because the dst format is exotic — NV12 → RGBA on cores
-        # where the alpha path isn't wired, or a stride that the
-        # core's allocator can't satisfy). BGR_888 is the cheapest
-        # universally-supported HWC format and what the post-
-        # process helpers expect. _rga_nv12_to handles the 16-aligned
-        # dst-width requirement.
-        if bgr_ndarray is None:
-            try:
-                bgr_ndarray = self._rga_nv12_to(
-                    frame, target_w, target_h, rga.RgaFormat.BGR_888, 3, "HWC",
-                )
-            except RuntimeError:
-                bgr_ndarray = None
-
-        # Step 3: if RGA is completely unavailable, fall back to cv2.
-        if bgr_ndarray is None:
-            # Both RGA attempts failed; surface that to the operator.
-            # On RGA2 this happens for rare combinations (e.g. NV12
-            # → GRAY at odd widths, or sizes beyond the core's
-            # maximum output). The cv2 path is correct but ~5-10x
-            # slower than the RGA path, so make it visible.
-            import sys
-            print(
-                f"[rkv] RGA failed for NV12→{rga.format_name(rga_fmt)} at "
-                f"{target_w}x{target_h}; falling back to cv2",
-                file=sys.stderr, flush=True,
-            )
-            bgr_ndarray = _nv12_to_bgr(frame)
-            if bgr_ndarray is None:
-                return None
-            # Resize via cv2 if needed.
-            if (bgr_ndarray.shape[1], bgr_ndarray.shape[0]) != (target_w, target_h):
-                bgr_ndarray = cv2.resize(
-                    bgr_ndarray, (target_w, target_h),
-                )
-
-        # If RGA already produced the requested target format, we
-        # already have the answer. No post-process needed.
-        if rga_native_format and (rga_fmt, layout) in (
-            (rga.RgaFormat.BGR_888, "HWC"),
-            (rga.RgaFormat.RGB_888, "HWC"),
-            (rga.RgaFormat.YCbCr_420_SP, "YUV"),
-            (rga.RgaFormat.YCrCb_420_SP, "YUV"),
-            (rga.RgaFormat.YCbCr_400, "GRAY"),
-        ):
-            return bgr_ndarray
-
-        # RGA gave us BGR (Step 1 with a BGR-family rga_fmt, or Step
-        # 2's BGR_888 fallback, or the cv2 path). Convert to the
-        # requested target format via cv2. The BGR→X cvtColor codes
-        # / _bgr_to_nv12 / _bgr_to_nv21 helpers all expect BGR
-        # input — by the time we reach here, that's what we have.
-        if rga_fmt == rga.RgaFormat.BGR_888:
-            return bgr_ndarray
-        if rga_fmt == rga.RgaFormat.RGB_888:
-            return cv2.cvtColor(bgr_ndarray, cv2.COLOR_BGR2RGB)
-        if rga_fmt == rga.RgaFormat.BGRA_8888:
-            return cv2.cvtColor(bgr_ndarray, cv2.COLOR_BGR2BGRA)
-        if rga_fmt == rga.RgaFormat.RGBA_8888:
-            return cv2.cvtColor(bgr_ndarray, cv2.COLOR_BGR2RGBA)
-        if rga_fmt == rga.RgaFormat.YCbCr_420_SP:
-            return _bgr_to_nv12(bgr_ndarray)
-        if rga_fmt == rga.RgaFormat.YCrCb_420_SP:
-            return _bgr_to_nv21(bgr_ndarray)
-        if rga_fmt == rga.RgaFormat.YCbCr_400:
-            return cv2.cvtColor(bgr_ndarray, cv2.COLOR_BGR2GRAY)
-        return bgr_ndarray
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"RGA cannot convert MPP {_MPP_TO_RGA_NAME[frame.fmt]} "
+                f"{frame.width}x{frame.height} to {rga.format_name(target_fmt)} "
+                f"{target_w}x{target_h}: {e}"
+            ) from e
 
     def _rga_nv12_to(
         self,
@@ -983,145 +792,41 @@ class VideoCapture:
         target_fmt: int,
         target_bpp: float,
         target_layout: str,
-    ) -> Optional[np.ndarray]:
+    ) -> np.ndarray:
         """RGA-only: NV12(NV21/I420) → ``target_fmt`` at ``target_w×H``.
 
-        Returns the ndarray view, or raises RuntimeError if RGA rejects
-        the call. Caller decides what to do on failure.
+        Raises ``RuntimeError`` if RGA rejects the call.
         """
         hor_stride = frame.hor_stride or frame.width
         ver_stride = frame.ver_stride or frame.height
+        input_fmt = _MPP_TO_RGA_FMT[frame.fmt]
 
-        src = None
         if frame.fd is not None and frame.fd >= 0:
-            try:
-                src = rga.wrap_nv12_fd(
-                    frame.fd, frame.width, frame.height,
-                    hor_stride=hor_stride, ver_stride=ver_stride,
-                )
-            except RuntimeError:
-                src = None
-        if src is None:
-            try:
-                src = rga.wrap_nv12(
-                    frame.ptr, frame.width, frame.height,
-                    hor_stride=hor_stride, ver_stride=ver_stride,
-                )
-            except RuntimeError:
-                raise
+            src = rga.wrap_fd(
+                frame.fd, frame.width, frame.height, input_fmt,
+                wstride=hor_stride, hstride=ver_stride,
+            )
+        else:
+            src = rga.wrap_virtual(
+                frame.ptr, frame.width, frame.height, input_fmt,
+                wstride=hor_stride, hstride=ver_stride,
+            )
 
-        # RGA2 (and several RGA3 firmwares) require the dst width /
-        # stride to be 16-aligned for RGB-family output formats —
-        # imcheck rejects with "rgb888 width stride should be 16
-        # aligned" otherwise (verified on the RGA2_Enhance + RGA3
-        # core in im2d v1.10.4). The source side is fine: MPP
-        # already hands us hor_stride=1376 for a 1366-wide H.264
-        # frame, which is 16-aligned. Round the dst up to a
-        # 16-multiple, allocate the buffer with that aligned width,
-        # and slice the result back to the caller's target_w before
-        # returning.
         rga_w = (target_w + 15) & ~15
 
         buf = self._ensure_bgr_buffer(rga_w, target_h, fmt=target_fmt)
         dst = rga.wrap_virtual(
             ctypes.addressof(buf), rga_w, target_h, target_fmt,
         )
-        # Same-size uses cvtcolor; otherwise resize. YUV / GRAY dsts
-        # always use cvtcolor because imresize_t rejects YCbCr_400.
         if (target_w, target_h) == (frame.width, frame.height) or target_layout != "HWC":
             rga.cvtcolor(src, dst)
         else:
             rga.resize(src, dst)
         rga.flush()
-        # Strip the right-edge padding columns (rga_w - target_w of
-        # them) so the returned ndarray is exactly the requested
-        # resolution. _as_ndarray reshapes the underlying storage
-        # using rga_w, so the column slice is what trims the view.
         out = _as_ndarray(buf, rga_w, target_h, target_bpp, target_layout)
         if rga_w != target_w:
             out = out[:, :target_w]
         return out
-
-
-def _bgr_to_nv12(bgr: np.ndarray) -> np.ndarray:
-    """Convert a BGR ndarray to NV12 layout (Y plane + interleaved UV).
-
-    Output shape: ``(H * 3 // 2, W)`` so callers can hand it straight
-    to another YUV codec / encoder. Returns a fresh contiguous ndarray.
-    """
-    h, w = bgr.shape[:2]
-    yuv_i420 = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)
-    # cv2's I420 buffer: Y plane fills the first h rows; the next
-    # h/2 rows hold U (left w/2 cols) and V (right w/2 cols) side by
-    # side. NV12 wants the Y plane then interleaved UV (cols U,V,U,V).
-    y = yuv_i420[:h, :]
-    uv_split = yuv_i420[h:, :]
-    u = uv_split[:, :w // 2]
-    v = uv_split[:, w // 2:]
-    flat = np.empty(h * w + (h // 2) * w, dtype=np.uint8)
-    flat[:h * w] = y.reshape(-1)
-    uv = flat[h * w:].reshape(h // 2, w)
-    uv[:, 0::2] = u
-    uv[:, 1::2] = v
-    return flat.reshape(h * 3 // 2, w)
-
-
-def _bgr_to_nv21(bgr: np.ndarray) -> np.ndarray:
-    """Convert a BGR ndarray to NV21 layout (Y plane + interleaved VU)."""
-    h, w = bgr.shape[:2]
-    yuv_i420 = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)
-    y = yuv_i420[:h, :]
-    uv_split = yuv_i420[h:, :]
-    v = uv_split[:, :w // 2]
-    u = uv_split[:, w // 2:]
-    flat = np.empty(h * w + (h // 2) * w, dtype=np.uint8)
-    flat[:h * w] = y.reshape(-1)
-    vu = flat[h * w:].reshape(h // 2, w)
-    vu[:, 0::2] = v   # NV21 = V then U
-    vu[:, 1::2] = u
-    return flat.reshape(h * 3 // 2, w)
-
-
-def _nv12_to_bgr(frame: DecodedFrame) -> Optional[np.ndarray]:
-    """Convert an MPP frame's YUV buffer into a contiguous BGR ndarray.
-
-    Supports NV12 (most common), NV21 and I420 — anything else is
-    dropped (returning ``None``). The output ndarray is a fresh
-    allocation owned by OpenCV; the source MPP buffer is read in-place
-    and can be released as soon as this function returns.
-
-    No intermediate copy of the YUV data is needed: ``cv2.cvtColor``
-    handles the non-contiguous YUV slice produced by stride padding
-    directly, and the frame is released only after cv2 returns, so the
-    source memory stays valid for the duration of the conversion.
-    """
-    if frame.ptr == 0 or frame.buf_size == 0:
-        return None
-    if frame.fmt not in _FRAME_BGR_FORMATS:
-        return None
-
-    w, h = frame.width, frame.height
-    hor_stride, ver_stride = frame.hor_stride, frame.ver_stride
-    total = hor_stride * ver_stride * 3 // 2
-    if total > frame.buf_size:
-        total = frame.buf_size
-
-    raw = np.ctypeslib.as_array(
-        (ctypes.c_uint8 * total).from_address(frame.ptr)
-    ).reshape(ver_stride * 3 // 2, hor_stride)
-
-    # cv2's NV12/NV21/I420 decoders want a (h*1.5, w) buffer; the rest
-    # of the MppBuffer is decoder padding. Pass the (possibly
-    # non-contiguous) slice directly — cv2 handles strides internally
-    # and the output is always a fresh contiguous BGR allocation.
-    yuv = raw[: h * 3 // 2, :w]
-    if frame.fmt == 0:
-        return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
-    if frame.fmt == 5:
-        return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV21)
-    if frame.fmt == 4:
-        return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
-    return None
 
 
 __all__ = ["VideoCapture"]

@@ -113,51 +113,133 @@ _rga_lock = threading.RLock()
 # Surface formats (subset of rga.h's _Rga_SURF_FORMAT — enough for video)
 # ---------------------------------------------------------------------------
 #
-# Each constant is `(RK_FORMAT_XXX) << 8`, matching the C enum. We only
-# carry the ones we need: NV12 / NV21 / I420 for H.264/HEVC output and
-# the OpenCV-compatible BGR/BGRX/RGB/RGBA family for the host.
-
 class RgaFormat:
-    # YUV — 2 plane (semi-planar, "SP")
-    YCbCr_420_SP = 0x0A << 8   # NV12: YYYY...UV...
-    YCrCb_420_SP = 0x0E << 8   # NV21: YYYY...VU...
-    YCbCr_422_SP = 0x08 << 8
-    YCrCb_422_SP = 0x0C << 8
-    YCbCr_420_P  = 0x0B << 8   # I420: YYYY...U...V...
-    YCrCb_420_P  = 0x0F << 8
-    YV12_420_P   = 0x0B << 8  # alias for I420
-
-    # Luma-only — write just the Y plane, no chroma
-    YCbCr_400    = 0x15 << 8   # single-channel grayscale
-
-    # RGB / BGR — packed
-    RGB_565    = 0x04 << 8
-    RGB_888    = 0x02 << 8
-    BGR_888    = 0x07 << 8
     RGBA_8888  = 0x00 << 8
-    BGRA_8888  = 0x03 << 8
     RGBX_8888  = 0x01 << 8
+    RGB_888    = 0x02 << 8
+    BGRA_8888  = 0x03 << 8
+    RGB_565    = 0x04 << 8
+    RGBA_5551  = 0x05 << 8
+    RGBA_4444  = 0x06 << 8
+    BGR_888    = 0x07 << 8
     BGRX_8888  = 0x16 << 8
+    BGR_565    = 0x24 << 8
+    BGRA_5551  = 0x25 << 8
+    BGRA_4444  = 0x26 << 8
+    ARGB_8888  = 0x28 << 8
+    XRGB_8888  = 0x29 << 8
+    ARGB_5551  = 0x2A << 8
+    ARGB_4444  = 0x2B << 8
+    ABGR_8888  = 0x2C << 8
+    XBGR_8888  = 0x2D << 8
+    ABGR_5551  = 0x2E << 8
+    ABGR_4444  = 0x2F << 8
+    RGBA2BPP   = 0x30 << 8
+
+    YCbCr_422_SP     = 0x08 << 8
+    YCrCb_422_SP     = 0x0C << 8
+    YCbCr_420_SP     = 0x0A << 8
+    YCrCb_420_SP     = 0x0E << 8
+    YCbCr_422_SP_10B = 0x22 << 8
+    YCrCb_422_SP_10B = 0x23 << 8
+    YCbCr_422_10b_SP = YCbCr_422_SP_10B
+    YCrCb_422_10b_SP = YCrCb_422_SP_10B
+    YCbCr_420_SP_10B = 0x20 << 8
+    YCrCb_420_SP_10B = 0x21 << 8
+
+    YCbCr_422_P  = 0x09 << 8
+    YCrCb_422_P  = 0x0D << 8
+    YCbCr_420_P  = 0x0B << 8
+    YCrCb_420_P  = 0x0F << 8
+    YV12_420_P   = 0x0B << 8
+
+    YVYU_422     = 0x18 << 8
+    YVYU_420     = 0x19 << 8
+    VYUY_422     = 0x1A << 8
+    VYUY_420     = 0x1B << 8
+    YUYV_422     = 0x1C << 8
+    YUYV_420     = 0x1D << 8
+    UYVY_422     = 0x1E << 8
+    UYVY_420     = 0x1F << 8
+
+    YCbCr_444_SP = 0x32 << 8
+    YCrCb_444_SP = 0x33 << 8
+
+    BPP1         = 0x10 << 8
+    BPP2         = 0x11 << 8
+    BPP4         = 0x12 << 8
+    BPP8         = 0x13 << 8
+    Y4           = 0x14 << 8
+    YCbCr_400    = 0x15 << 8
+    A8           = 0x31 << 8
+    Y8           = 0x34 << 8
+
+    UNKNOWN      = 0x100 << 8
 
 
 # BPP lookup, used for buffer-size calculation when RGA allocates
 # destination storage. Values match the C ``get_bpp_from_format`` helper
 # in RgaUtils.h.
 _BPP = {
-    RgaFormat.YCbCr_420_SP: 1.5,
-    RgaFormat.YCrCb_420_SP: 1.5,
-    RgaFormat.YCbCr_422_SP: 2,
-    RgaFormat.YCrCb_422_SP: 2,
+    RgaFormat.RGBA_8888:    4,
+    RgaFormat.RGBX_8888:    4,
+    RgaFormat.RGB_888:      3,
+    RgaFormat.BGRA_8888:    4,
+    RgaFormat.RGB_565:      2,
+    RgaFormat.RGBA_5551:    2,
+    RgaFormat.RGBA_4444:    2,
+    RgaFormat.BGR_888:      3,
+    RgaFormat.BGRX_8888:    4,
+    RgaFormat.BGR_565:      2,
+    RgaFormat.BGRA_5551:    2,
+    RgaFormat.BGRA_4444:    2,
+    RgaFormat.ARGB_8888:    4,
+    RgaFormat.XRGB_8888:    4,
+    RgaFormat.ARGB_5551:    2,
+    RgaFormat.ARGB_4444:    2,
+    RgaFormat.ABGR_8888:    4,
+    RgaFormat.XBGR_8888:    4,
+    RgaFormat.ABGR_5551:    2,
+    RgaFormat.ABGR_4444:    2,
+    RgaFormat.RGBA2BPP:     0.25,
+
+    RgaFormat.YCbCr_422_SP:     2,
+    RgaFormat.YCrCb_422_SP:     2,
+    RgaFormat.YCbCr_420_SP:     1.5,
+    RgaFormat.YCrCb_420_SP:     1.5,
+    RgaFormat.YCbCr_422_SP_10B: 2.5,
+    RgaFormat.YCrCb_422_SP_10B: 2.5,
+    RgaFormat.YCbCr_420_SP_10B: 2,
+    RgaFormat.YCrCb_420_SP_10B: 2,
+
+    RgaFormat.YCbCr_422_P:  2,
+    RgaFormat.YCrCb_422_P:  2,
     RgaFormat.YCbCr_420_P:  1.5,
     RgaFormat.YCrCb_420_P:  1.5,
-    RgaFormat.YCbCr_400:    1,    # luma-only, 1 byte/pixel
-    RgaFormat.RGB_565:      2,
-    RgaFormat.RGB_888:      3,
-    RgaFormat.BGR_888:      3,
-    RgaFormat.RGBA_8888:    4,
-    RgaFormat.BGRA_8888:    4,
-    RgaFormat.RGBX_8888:    4,
-    RgaFormat.BGRX_8888:    4,
+    RgaFormat.YV12_420_P:   1.5,
+
+    RgaFormat.YVYU_422:     2,
+    RgaFormat.YVYU_420:     2,
+    RgaFormat.VYUY_422:     2,
+    RgaFormat.VYUY_420:     2,
+    RgaFormat.YUYV_422:     2,
+    RgaFormat.YUYV_420:     2,
+    RgaFormat.UYVY_422:     2,
+    RgaFormat.UYVY_420:     2,
+
+    RgaFormat.YCbCr_444_SP: 3,
+    RgaFormat.YCrCb_444_SP: 3,
+
+    RgaFormat.BPP1:         1,
+    RgaFormat.BPP2:         1,
+    RgaFormat.BPP4:         1,
+    RgaFormat.BPP8:         1,
+    RgaFormat.Y4:           0.5,
+    RgaFormat.YCbCr_400:    1,
+    RgaFormat.A8:           1,
+    RgaFormat.Y8:           1,
+
+    RgaFormat.UNKNOWN:      0,
 }
 
 

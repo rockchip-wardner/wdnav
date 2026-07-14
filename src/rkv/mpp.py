@@ -441,7 +441,7 @@ class DecodedFrame:
     dance that ``ptr`` would require.
 
     ``ptr`` is still populated for callers who want to feed the frame
-    into a CPU-side pipeline (``cv2.cvtColor``, numpy ops, etc.). If
+    into a CPU-side pipeline (OpenCV, numpy ops, etc.). If
     the CPU is going to read it, call :func:`mpp_buffer_sync_cpu_read`
     *before* touching the memory, and :func:`mpp_buffer_sync_cpu_write`
     *after* any write — the wrapper does that automatically for the

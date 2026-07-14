@@ -24,7 +24,12 @@ from __future__ import annotations
 import os
 import sys
 
-import cv2
+try:
+    import cv2
+    _has_cv2 = True
+except ImportError:
+    cv2 = None
+    _has_cv2 = False
 
 from rkv import MediaDevice, VideoCapture
 
@@ -87,7 +92,7 @@ def main(argv: list[str]) -> int:
     capture_path = capture_nodes[0].device_path
     print(f"\n== opening capture node {capture_path} ==")
 
-    window_open = os.environ.get("DISPLAY", "1") != "0"
+    window_open = _has_cv2 and os.environ.get("DISPLAY", "1") != "0"
 
     try:
         cap = VideoCapture(capture_path)
