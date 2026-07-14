@@ -45,18 +45,12 @@ multiple processes (one per stream) instead of threads.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import threading
 import time
 from typing import List, Optional, Tuple
 
-try:
-    import cv2
-    _has_cv2 = True
-except ImportError:
-    cv2 = None
-    _has_cv2 = False
+import cv2
 import numpy as np
 
 from rkv import VideoCapture
@@ -170,20 +164,17 @@ def _render_cell(stream: Stream, cell_w: int, cell_h: int) -> np.ndarray:
     """Return a (cell_h, cell_w, 3) BGR ndarray for one grid cell."""
     if stream.error is not None:
         cell = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
-        if _has_cv2:
-            cv2.putText(
-                cell, stream.error, (8, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA,
-            )
+        cv2.putText(
+            cell, stream.error, (8, 24),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA,
+        )
         return cell
     with stream.lock:
         frame = stream.latest
     if frame is None:
         return np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
     if frame.shape[1] != cell_w or frame.shape[0] != cell_h:
-        if _has_cv2:
-            return cv2.resize(frame, (cell_w, cell_h))
-        return np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+        return cv2.resize(frame, (cell_w, cell_h))
     return frame
 
 
@@ -219,10 +210,8 @@ def main(args: argparse.Namespace) -> int:
     for t in threads:
         t.start()
 
-    show_window = _has_cv2 and os.environ.get("DISPLAY", "1") != "0"
-    if show_window:
-        cv2.namedWindow("rkv multi-decoder", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("rkv multi-decoder", grid_w, grid_h)
+    cv2.namedWindow("rkv multi-decoder", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("rkv multi-decoder", grid_w, grid_h)
 
     grid = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
     last_stats = time.monotonic()
@@ -233,13 +222,10 @@ def main(args: argparse.Namespace) -> int:
                 x, y = _slot_xy(s.slot, cell_w, cell_h)
                 grid[y : y + cell_h, x : x + cell_w] = cell
 
-            if show_window:
-                cv2.imshow("rkv multi-decoder", grid)
-                key = cv2.waitKey(30) & 0xFF
-                if key == ord("q"):
-                    break
-            else:
-                key = None
+            cv2.imshow("rkv multi-decoder", grid)
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord("q"):
+                break
 
             now = time.monotonic()
             if now - last_stats >= args.stats_interval:
@@ -253,12 +239,10 @@ def main(args: argparse.Namespace) -> int:
                 last_stats = now
 
             if all(s.eof or s.error for s in streams):
-                if show_window:
-                    cv2.waitKey(0)
+                cv2.waitKey(0)
                 break
     finally:
-        if show_window:
-            cv2.destroyAllWindows()
+        cv2.destroyAllWindows()
         for t in threads:
             t.join(timeout=1.0)
 

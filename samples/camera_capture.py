@@ -21,15 +21,9 @@ to read until the source EOFs or release() is called.
 
 from __future__ import annotations
 
-import os
 import sys
 
-try:
-    import cv2
-    _has_cv2 = True
-except ImportError:
-    cv2 = None
-    _has_cv2 = False
+import cv2
 
 from rkv import MediaDevice, VideoCapture
 
@@ -92,7 +86,7 @@ def main(argv: list[str]) -> int:
     capture_path = capture_nodes[0].device_path
     print(f"\n== opening capture node {capture_path} ==")
 
-    window_open = _has_cv2 and os.environ.get("DISPLAY", "1") != "0"
+    window_open = True
 
     try:
         cap = VideoCapture(capture_path)

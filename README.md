@@ -65,8 +65,7 @@ ret, frame = cap.read(w, h, fmt)  # 这是 cv2 没有的接口，使用 RGA 进�
 # 其他详细示例见 samples/ 目录
 ```
 
-`samples/*.py` 默认使用 cv2 做显示；要跑无显示版本，设 `DISPLAY=0`，或在没装
-`opencv-python` 的环境直接跑——脚本会自动降级为每 30 帧打印一次的 headless 循环。
+`samples/*.py` 直接 `import cv2` 做窗口显示，跑前 `pip install opencv-python`。
 
 ## 兼容性
 

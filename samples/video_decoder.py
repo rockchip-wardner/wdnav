@@ -14,15 +14,9 @@ non-terminating sources (RTSP, live cameras), cap the run with
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 
-try:
-    import cv2
-    _has_cv2 = True
-except ImportError:
-    cv2 = None
-    _has_cv2 = False
+import cv2
 
 from rkv import VideoCapture
 
@@ -62,30 +56,24 @@ def main(args) -> int:
 
     print(f"opened {args.path}: {cap.width}x{cap.height} @ {cap.fps:.2f} fps")
 
-    show_window = _has_cv2 and os.environ.get("DISPLAY", "1") != "0"
-    if show_window:
-        cv2.namedWindow("Video Player", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Video Player", min(cap.width, 1280), min(cap.height, 720))
+    cv2.namedWindow("Video Player", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Video Player", min(cap.width, 1280), min(cap.height, 720))
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        if show_window:
-            cv2.imshow("Video Player", frame)
-            if cv2.waitKey(25) & 0xFF == ord("q"):
-                break
-        elif cap.frame_pos % 30 == 0:
-            print(f"  frame {cap.frame_pos}")
+        cv2.imshow("Video Player", frame)
+        if cv2.waitKey(25) & 0xFF == ord("q"):
+            break
 
         if args.max_frames and cap.frame_pos >= args.max_frames:
             break
 
     print(f"played {cap.frame_pos} frames")
     cap.release()
-    if show_window:
-        cv2.destroyAllWindows()
+    cv2.destroyAllWindows()
     return 0
 
 
