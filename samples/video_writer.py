@@ -2,11 +2,16 @@
 """Smoke sample for ``rkv.VideoWriter``.
 
 Reads one BGR frame from a synthetic source and writes it to a local
-MP4 (or any extension PyAV understands) using the hardware/software
-encoder pipeline. The default codec picks ``mp4v`` because it doesn't
-need an external library; pass ``--codec h264`` (or just leave the
-default) to get H.264 via MPP hardware on Rockchip, or PyAV's
-``libx264`` as a fallback. Run::
+MP4 (or any extension PyAV understands) using the MPP hardware
+encoder. Codec choices:
+
+* ``mp4v`` (default) — PyAV's built-in MPEG-4 Part 2 software
+  encoder, works on any machine.
+* ``h264`` — MPP hardware only (requires Rockchip SoC); raises
+  ``RuntimeError`` on platforms where MPP isn't available.
+* ``mjpeg`` — PyAV's built-in MJPEG software encoder.
+
+Run::
 
     python samples/video_writer.py /tmp/out.mp4
     python samples/video_writer.py /tmp/out.mp4 h264

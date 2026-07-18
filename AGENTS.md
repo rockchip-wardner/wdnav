@@ -21,8 +21,11 @@ MPP / RGA / V4L2 / DmaHeap / GPU Python binding (import name `rkv`, distribution
 
 ## 接口设计
 
+### 设计原则
+
 - 兼容cv2,但不重复调用cv2，rkv不对cv2做任何依赖
-- 使用pyav做握手和demux
+- 使用pyav做握手和demux，不使用pyav和libx264做任何编解码操作，编解码由mpp来完成
+- 不做任何软解和软拷贝的fallback操作，如果mpp、rga、mali库都完不成的操作就直接报错
 
 ### 视频解码
 
@@ -32,7 +35,7 @@ cap = rkv.VideoCapture(path)  # path 可以是本地文件、网络流或V4l2设
 ret, frame = cap.read()  # 与 cv2 用法一致；BGR (H, W, 3) ndarray
 ret, frame = cap.read(w, h, fmt)  # 这是 cv2 没有的接口，使用 RGA 进行指定分辨率/像素格式的转换
 ret, frame0 = cap.read0(w, h, fmt) # 这是0拷贝接口，获取到的是dmabuffer的fd等内容，可以对接传递给
-cap.read0(...).numpy()得到的结果就是cap.read(...)
+# cap.read0(...).numpy()得到的结果就是cap.read(...) #
 ```
 
 ### 视频编码

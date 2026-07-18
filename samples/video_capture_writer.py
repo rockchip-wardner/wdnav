@@ -4,7 +4,7 @@
 Wires up the two halves of the public API so a single command exercises
 both directions of the pipeline — VPU decode (MPP) + RGA colour
 conversion on the read side, MPP hardware encoding (or PyAV's
-``libx264`` software fallback) on the write side. Useful as a sanity
+(MPP hardware-only) on the write side. Useful as a sanity
 check that both halves still work after refactors, and as a starting
 point for transcode / passthrough pipelines.
 

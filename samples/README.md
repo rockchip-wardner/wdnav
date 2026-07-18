@@ -15,7 +15,7 @@
 | 文件 | 演示内容 |
 | --- | --- |
 | `video_decoder.py` | 单路 H.264/H.265 硬件解码 + cv2 显示 |
-| `video_writer.py` | 合成 BGR 帧 → MPP 硬编 / PyAV libx264 / ``rkv+ws://`` 写 MP4 |
+| `video_writer.py` | 合成 BGR 帧 → MPP 硬编 (H.264) / PyAV mpeg4 (mp4v) / ``rkv+ws://`` 写 MP4 |
 | `video_capture_writer.py` | ``VideoCapture`` 读 → ``VideoWriter`` 写的端到端转码样例 |
 | `multi_decoder.py` | 4 路并行解码 + cv2 拼成 2×2 田字格 |
 | `camera_capture.py` | `/dev/videoX` 摄像头捕获 |

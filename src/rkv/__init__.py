@@ -65,7 +65,8 @@ except Exception:  # pragma: no cover - /dev/dma_heap not present
     list_heaps = None     # type: ignore[assignment]
 
 # ``VideoWriter`` uses ``av`` (PyAV) for muxing and either MPP
-# hardware encoding or PyAV's libx264 software backend for the
+# hardware encoding or PyAV's built-in mp4v / mjpeg encoders
+# for the non-H.264 codecs — the encoder module is the reference.
 # encoded bytes — see :mod:`rkv.encoder` for the full story.
 # Imported lazily so a missing PyAV on a dev box surfaces as a
 # clear ``VideoWriter = None`` rather than an ``import rkv`` failure.

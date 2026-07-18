@@ -1,31 +1,36 @@
-"""VideoWriter — hardware/software video encoder sink (no cv2).
+"""VideoWriter — MPP hardware encoder sink (no cv2, no libx264).
 
-Replaces the original cv2.VideoWriter / cv2.imencode based sink. Local
-files go through PyAV for muxing; the encoded byte stream comes from
-one of two backends:
+Replaces the original cv2.VideoWriter / cv2.imencode based sink. The
+encoded byte stream comes from one backend:
 
-  * **MPP** (hardware) — :class:`rkv.mpp.MppEncoder`. When the input
-    is a :class:`rkv.mpp.DecodedFrame` (zero-copy DMA-BUF straight
-    from :meth:`VideoCapture.read0`) the encoder imports the
-    decoder's fd as an :class:`MppBuffer` via
-    ``mpp_buffer_import_with_tag`` and feeds it straight to the VPU
-    — **no RGA, no Python-side memmove, no numpy intermediate**
-    between decode and encode. Fallback for BGR ndarray input:
-    ``mpp_buffer_get_ptr`` + ``memmove`` (1 CPU copy) + on-chip
-    BGR→YUV. PyAV only muxes the encoded NALs into the requested
-    container (MP4 / MKV / …).
-  * **PyAV** (software) — :mod:`av.codec.Codec` ``libx264`` (or
-    ``mjpeg``). Used as a fallback when the MPP encoder can't be
-    initialised (e.g. development box without a Rockchip SoC, or
-    platform builds where :class:`rkv.mpp.MppEncoder` raises on the
-    first frame). Always operates on BGR ndarray; 1 RGA DMA copy
-    from the decoder's DMA-BUF (via ``DecodedFrame.numpy``) + 1
-    libx264 encode.
+  * **MPP** (hardware) — :class:`rkv.mpp.MppEncoder`. The encoder
+    runs on the Rockchip VPU and accepts BGR / NV12 / I420 input.
+    When the input is a :class:`rkv.mpp.DecodedFrame` (zero-copy
+    DMA-BUF straight from :meth:`VideoCapture.read0`) the encoder
+    imports the decoder's fd as an :class:`MppBuffer` via
+    ``mpp_buffer_import_with_tag`` and feeds it straight to the
+    VPU — **no RGA, no Python-side memmove, no numpy intermediate**
+    between decode and encode. For BGR ndarray input: one
+    ``memmove`` + on-chip BGR→YUV. PyAV's only role is muxing the
+    encoded NALs into the requested container (MP4 / MKV / …).
 
-The ``rkv+ws://`` sink always uses PyAV's software MJPEG encoder —
-JPEG packets are the simplest wire format that pyrkaiweb's ingest
-handler accepts. Pushing raw H.264 NALs down the same socket would
-need a separate protocol change on the server side.
+  H.264 is MPP-only — there is no software fallback. Picking
+  ``codec="h264"`` on a box where :class:`rkv.mpp.MppEncoder` can't
+  initialise (no Rockchip SoC, or an MPP build that rejects the
+  requested width / profile) raises ``RuntimeError`` at construction
+  time. The non-H.264 codecs (``mp4v`` for local files,
+  ``mjpeg`` for ``rkv+ws://``) still go through PyAV's own
+  built-in encoders — those don't need libx264.
+
+The ``rkv+ws://`` sink supports two wire formats:
+
+  * ``codec="mjpeg"`` (default) — PyAV's software MJPEG encoder,
+    one packet per frame. JPEG is the simplest wire format that
+    pyrkaiweb's ingest handler accepts.
+  * ``codec="h264"`` — :class:`rkv.mpp.MppEncoder` for VPU H.264,
+    laid out as avcC header + 4-byte length-prefixed NAL access
+    units (MSE-friendly). Backend selection: ``"ws-h264-mpp"`` on
+    Rockchip, ``RuntimeError`` if MPP isn't available.
 
 Public API mirrors OpenCV's ``VideoWriter`` so existing call sites
 work unchanged:
@@ -34,6 +39,13 @@ work unchanged:
                       codec="mp4v", gop=30, bitrate=2_000_000)
     out.write(frame)                # BGR (H, W, 3) uint8 ndarray
     out.write(frame0)              # DecodedFrame with .fd (zero-copy)
+
+    out = VideoWriter("rkv+ws://host:9999/source", fps=30,
+                      frame_size=(640, 360),
+                      codec="h264", gop=30, bitrate=2_000_000)
+    # → sends avcC header + length-prefixed H.264 NAL units over WS
+    out.write(frame)                # BGR ndarray
+    out.write(frame0)              # DecodedFrame (zero-copy DMA-BUF → MPP)
     out.release()
 
 Copy budget by path
@@ -41,18 +53,18 @@ Copy budget by path
 
 ``read0() → write(frame0)``:
 
-  | path                    | CPU copies | DMA copies | hw passes |
-  |-------------------------|-----------:|------------:|-----------:|
-  | MPP zero-copy (DMA-BUF) |          0 |           1 |    NVPU+RGA|
-  | MPP eager BGR           |          1 |           1 |    NVPU+RGA|
-  | PyAV libx264            |          1 |           1 |    libx264 |
+  | path                    | CPU copies | hw passes |
+  |-------------------------|-----------:|-----------:|
+  | MPP zero-copy (DMA-BUF) |          0 |  VPU only  |
+  | MPP eager BGR           |          1 |  VPU only  |
+  | PyAV mp4v / mjpeg      |          1 |  PyAV      |
 
 The MPP zero-copy path is the headline: only the VPU and the encoder
 DMA engine touch the pixel data, the CPU never sees it. The single
-remaining DMA copy is the RGA colour-conversion / resize that's done
-by ``DecodedFrame.numpy`` (on demand) — eliminated entirely on the
-zero-copy branch because the encoder accepts NV12 directly without a
-BGR round-trip.
+remaining copy on the eager-BGR branch is the
+``memmove`` that pulls the numpy array into MPP's input buffer;
+on the zero-copy branch even that is gone because the encoder
+accepts NV12 directly without a BGR round-trip.
 """
 from __future__ import annotations
 
@@ -229,10 +241,12 @@ class VideoWriter:
     frame_size:
         ``(width, height)`` — required.
     codec:
-        ``"h264"`` (default, hardware MPP on Rockchip, software
-        libx264 elsewhere), ``"mjpeg"`` (Motion JPEG in AVI),
-        ``"mp4v"`` (MPEG-4 Part 2 in MP4, software only). The WS sink
-        always uses software MJPEG regardless of this argument.
+        ``"h264"`` (default, MPP hardware only — requires a
+        Rockchip SoC; raises on non-MPP platforms), ``"mjpeg"``
+        (Motion JPEG in AVI, PyAV software), ``"mp4v"`` (MPEG-4
+        Part 2 in MP4, PyAV software). The WS sink uses ``"mjpeg"``
+        by default; ``"h264"`` selects the H.264 wire format
+        described in :mod:`rkv.encoder`'s module docstring.
     profile:
         H.264 profile: ``"baseline"`` (default, no B-frames, lowest
         latency), ``"main"``, ``"high"``. Recorded; the backend
@@ -298,11 +312,17 @@ class VideoWriter:
         self._ws_sink: Optional["_WebSocketSink"] = None
         self._container = None
         self._stream = None
-        self._backend: str = ""  # "mpp", "pyav", "ws-jpeg"
+        self._ws_pts_us = 0
+        self._backend: str = ""  # "mpp" | "pyav" | "ws-jpeg" | "ws-h264-mpp"
 
         if path.startswith("rkv+ws://"):
             self._ws_sink = _WebSocketSink(path)
-            self._backend = "ws-jpeg"
+            if codec == self.CODEC_H264:
+                # H.264 WS path: MPP-only, raises on non-MPP platforms.
+                self._init_ws_h264()
+            else:
+                # Default JPEG wire format.
+                self._backend = "ws-jpeg"
             self._is_open = True
             return
 
@@ -312,22 +332,21 @@ class VideoWriter:
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
 
-        # Try MPP hardware encoder first; fall back to PyAV software
-        # if it can't initialise on this platform / build.
+        # H.264 is MPP-only — there is no software fallback. Other
+        # codecs (mp4v, mjpeg) still go through PyAV.
         if codec == self.CODEC_H264:
             try:
                 self._init_mpp(path)
-                self._backend = "mpp"
-                self._is_open = True
-                return
             except Exception as e:
-                # Surface the failure for diagnostics but keep going so
-                # the user gets a working writer on non-target boxes.
-                print(
-                    f"rkv.encoder: MPP hardware encoder unavailable ({e}); "
-                    f"falling back to PyAV libx264",
-                    flush=True,
-                )
+                raise RuntimeError(
+                    f"rkv.VideoWriter: H.264 local-file encoding requires "
+                    f"MPP hardware encoder but MppEncoder.init failed: "
+                    f"{e}. Use codec='mp4v' for a PyAV software path, or "
+                    f"run on Rockchip hardware."
+                ) from e
+            self._backend = "mpp"
+            self._is_open = True
+            return
 
         self._init_pyav(path)
         self._backend = "pyav"
@@ -425,18 +444,24 @@ class VideoWriter:
                 self._stream.codec_context.extradata = avcc
 
     def _init_pyav(self, path: str) -> None:
-        """Open the file using a PyAV software encoder.
+        """Open the file using PyAV's built-in encoders.
 
-        Picks ``libx264`` for H.264, ``mjpeg`` for MJPEG, ``mpeg4``
-        for MP4V. Output is always BGR in / H.264 out (re-encoded to
-        yuv420p inside PyAV).
+        Supports ``mp4v`` (``mpeg4``) and ``mjpeg`` (Motion JPEG).
+        H.264 deliberately isn't routed through this path — it's
+        MPP-only, see :meth:`_init_mpp` and :meth:`_init_ws_h264`.
         """
         av = _import_av()
         codec_map = {
-            self.CODEC_H264: ("libx264", "yuv420p"),
             self.CODEC_MJPEG: ("mjpeg", "yuvj420p"),
             self.CODEC_MP4V: ("mpeg4", "yuv420p"),
         }
+        if self._codec == self.CODEC_H264:
+            raise RuntimeError(
+                "VideoWriter._init_pyav called for H.264 — that path "
+                "should be routed through _init_mpp. This is a bug."
+            )
+        if self._codec not in codec_map:
+            raise ValueError(f"unsupported codec for PyAV path: {self._codec!r}")
         codec_name, pix_fmt = codec_map[self._codec]
         # Choose container format from the file extension; default to
         # MP4 if PyAV can't autodetect.
@@ -446,25 +471,12 @@ class VideoWriter:
             "mov": "mp4",
             "mkv": "matroska",
             "avi": "avi",
-            "h264": "h264",
         }.get(ext)
 
-        kwargs = {}
-        if self._codec == self.CODEC_H264:
-            x264_opts = {
-                "preset": "ultrafast",
-                "tune": "zerolatency",
-                "profile": self._profile_name,
-                "x264-params": f"keyint={self._gop}:min-keyint={self._gop}:scenecut=0",
-                "bf": str(self._bframes),
-                "b": str(self._bitrate),
-            }
-            kwargs["options"] = {k: v for k, v in x264_opts.items() if v}
-
         if container_format:
-            self._container = av.open(path, "w", format=container_format, **kwargs)
+            self._container = av.open(path, "w", format=container_format)
         else:
-            self._container = av.open(path, "w", **kwargs)
+            self._container = av.open(path, "w")
         self._stream = self._container.add_stream(codec_name, rate=self._fps)
         self._stream.width = self._width
         self._stream.height = self._height
@@ -475,6 +487,64 @@ class VideoWriter:
         # For PyAV to encode a BGR ndarray we need to convert to the
         # stream's pix_fmt. The write path handles that.
         self._encoder = None
+
+    def _init_ws_h264(self) -> None:
+        """Initialize an H.264 stream over the WebSocket sink.
+
+        Wire format (matches pyrkaiweb's ingest handler):
+
+        * One ``PKT_TYPE_HEADER`` packet first, carrying the
+          avcC configuration record built from the encoder's
+          SPS / PPS NAL units.
+        * Each subsequent access unit sent as ``PKT_TYPE_KEY`` or
+          ``PKT_TYPE_DELTA`` with the H.264 access unit's bytes
+          **length-prefixed** (4-byte big-endian length followed by
+          the NAL) — that's the layout MSE / ``html5 video`` expects.
+        * ``PKT_TYPE_EOS`` on :meth:`release`.
+
+        H.264 on the WS path is MPP-only — there is no software
+        fallback. If :class:`rkv.mpp.MppEncoder` can't initialise
+        here (no Rockchip SoC, or an MPP build that rejects the
+        requested width / profile), we raise ``RuntimeError`` so
+        the caller knows to fall back to a JPEG sink or a
+        Rockchip build instead of silently sending garbage.
+        """
+        from .mpp import MppEncoder
+
+        try:
+            self._encoder = MppEncoder(
+                width=self._width,
+                height=self._height,
+                fps=self._fps,
+                bitrate=self._bitrate,
+                gop=self._gop,
+                profile=self._profile_name,
+                rc_mode=self._rc_mode.lower(),
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"rkv.VideoWriter: H.264 over rkv+ws:// requires MPP "
+                f"hardware encoder but MppEncoder.init failed: {e}. "
+                f"Use codec='mjpeg' instead, or run on Rockchip hardware."
+            ) from e
+        self._backend = "ws-h264-mpp"
+        # Send avcC header up front so the receiver can build its
+        # MediaSource buffer without waiting for the first keyframe.
+        self._send_ws_h264_header(self._encoder.extradata)
+
+    def _send_ws_h264_header(self, annex_b_extradata: bytes) -> None:
+        """Send the avcC configuration record as ``PKT_TYPE_HEADER``.
+
+        ``annex_b_extradata`` is the SPS/PPS blob the encoder
+        exposed in Annex B form (start-code prefixed). ``_strip_annexb``
+        does both the conversion to length-prefixed and the avcC
+        build in one pass.
+        """
+        if not annex_b_extradata:
+            return
+        _, avcc = _strip_annexb(annex_b_extradata)
+        if avcc and self._ws_sink is not None:
+            self._ws_sink.send_packet(PKT_TYPE_HEADER, avcc, pts_us=0)
 
     # -- write --------------------------------------------------------------
 
@@ -496,16 +566,20 @@ class VideoWriter:
           drains. Falls back to the BGR-then-encoder path if the
           encoder can't be configured for the source format.
 
-        The PyAV software backend always operates on a BGR ndarray
-        (the underlying ``libx264`` doesn't take a DMA-BUF); a
-        ``DecodedFrame`` input is converted via :meth:`numpy` (one
-        RGA DMA copy) before reaching the encoder.
+        The PyAV software backend (``mp4v`` / ``mjpeg``) always
+        operates on a BGR ndarray; a ``DecodedFrame`` input is
+        converted via :meth:`numpy` (one RGA DMA copy) before
+        reaching the encoder. There is no software backend for
+        ``h264`` — that path requires MPP.
         """
         if not self.isOpened:
             raise RuntimeError("VideoWriter is closed")
 
         if self._ws_sink is not None:
-            self._send_ws_jpeg(frame)
+            if self._backend in ("ws-h264-mpp", "ws-h264-pyav"):
+                self._send_ws_h264(frame)
+            else:
+                self._send_ws_jpeg(frame)
             return
 
         # Zero-copy path: input is a DecodedFrame (DMA-BUF fd),
@@ -648,6 +722,73 @@ class VideoWriter:
             return
         pts_us = time.monotonic_ns() // 1000
         self._ws_sink.send_packet(PKT_TYPE_KEY, data, pts_us=pts_us)
+
+    def _send_ws_h264(self, frame) -> None:
+        """WS path: encode one BGR / ``DecodedFrame`` to H.264, push to WS.
+
+        Wire layout:
+
+        * ``PKT_TYPE_HEADER`` once with the avcC configuration
+          record (sent at init time by :meth:`_init_ws_h264`).
+        * One ``PKT_TYPE_KEY`` / ``PKT_TYPE_DELTA`` per access unit
+          with the H.264 bytes laid out as **4-byte
+          length-prefixed NAL units** — the layout MSE / ``html5
+          video`` expects. MPP emits Annex B (start-code
+          prefixed); :func:`_strip_annexb` rewrites the payload in
+          one pass.
+
+        MPP-only — see :meth:`_init_ws_h264` for why the PyAV
+        software fallback was removed.
+        """
+        if self._ws_sink is None or self._encoder is None:
+            return
+        is_decoded_frame = hasattr(frame, "fd")
+
+        pkt = self._mpp_encode_ws(frame, is_decoded_frame)
+        if pkt is None:
+            return
+        self._ws_pts_us += int(1_000_000 / max(self._fps, 1))
+        payload, _ = _strip_annexb(pkt.data)
+        if not payload:
+            return
+        pkt_type = PKT_TYPE_KEY if pkt.is_keyframe else PKT_TYPE_DELTA
+        self._ws_sink.send_packet(
+            pkt_type, payload, pts_us=self._ws_pts_us
+        )
+
+    def _mpp_encode_ws(self, frame, is_decoded_frame: bool):
+        """Submit one frame to the MPP encoder for the WS path.
+
+        Returns the :class:`EncodedPacket` (or ``None`` on failure).
+        Tries the zero-copy DMA-BUF path first when the input is a
+        :class:`DecodedFrame`; falls back to the eager BGR path if
+        the platform's encoder can't accept the import directly.
+        """
+        assert self._encoder is not None
+        if (
+            is_decoded_frame
+            and getattr(frame, "fd", -1) >= 0
+        ):
+            try:
+                from .mpp import MppFrameFormat
+
+                return self._encoder.encode_external_fd(
+                    fd=int(frame.fd),
+                    width=int(frame.width),
+                    height=int(frame.height),
+                    hor_stride=int(frame.hor_stride or frame.width),
+                    ver_stride=int(frame.ver_stride or frame.height),
+                    input_format=MppFrameFormat.YUV420SP,
+                    pts=self._ws_pts_us,
+                )
+            except RuntimeError as e:
+                print(
+                    f"rkv.encoder: WS zero-copy encode_external_fd failed "
+                    f"({e}); falling back to eager BGR path",
+                    flush=True,
+                )
+        bgr = self._decoded_frame_to_bgr(frame) if is_decoded_frame else frame
+        return self._encoder.encode(bgr)
 
     def _decoded_frame_to_bgr(self, frame) -> np.ndarray:
         """Best-effort ``DecodedFrame`` → BGR ndarray (zero-copy path).
