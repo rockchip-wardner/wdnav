@@ -1,11 +1,87 @@
 # -*- coding: utf-8 -*-
 """类型 stub —— 给 IDE / mypy 看，运行时不会被 import。"""
 
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
 __version__: str
+
+
+class DecodedFrame:
+    """A raw decoded frame returned by :meth:`VideoCapture.read0`.
+
+    Holds the DMA-BUF fd (or virtual address) of the underlying MPP /
+    V4L2 buffer; the actual pixel data sits in kernel-side memory and
+    only needs to be touched when :meth:`numpy` materialises it into a
+    contiguous ndarray via RGA2.
+    """
+
+    width: int
+    height: int
+    hor_stride: int
+    ver_stride: int
+    fmt: int
+    pts: int
+    ptr: int
+    fd: int
+    buf_size: int
+    raw: Any
+    out_w: Optional[int]
+    out_h: Optional[int]
+    out_fmt: Optional[str]
+    def numpy(
+        self,
+        w: Optional[int] = ...,
+        h: Optional[int] = ...,
+        fmt: Optional[str] = ...,
+    ) -> np.ndarray: ...
+
+
+class EncodedPacket:
+    """A single encoded access unit returned by ``MppEncoder.encode``."""
+
+    data: bytes
+    pts: int
+    is_keyframe: bool
+
+
+class MppEncoder:
+    def __init__(
+        self,
+        coding_type: int = ...,
+        *,
+        width: int = ...,
+        height: int = ...,
+        fps: int = ...,
+        bitrate: int = ...,
+        gop: int = ...,
+        profile: str = ...,
+        input_format: int = ...,
+        rc_mode: str = ...,
+    ) -> None: ...
+    width: int
+    height: int
+    fps: int
+    bitrate: int
+    gop: int
+    profile: str
+    rc_mode: str
+    extradata: bytes
+    def force_keyframe(self) -> None: ...
+    def encode(self, frame_bgr: np.ndarray) -> EncodedPacket: ...
+    def encode_external_fd(
+        self,
+        fd: int,
+        width: int,
+        height: int,
+        hor_stride: int,
+        ver_stride: int,
+        input_format: int = ...,
+        pts: int = ...,
+    ) -> EncodedPacket: ...
+    def flush(self) -> Optional[EncodedPacket]: ...
+    def close(self) -> None: ...
 
 
 class VideoCapture:
@@ -29,11 +105,58 @@ class VideoCapture:
         w: Optional[int] = ...,
         h: Optional[int] = ...,
         fmt: Optional[str] = ...,
-        *,
-        to: Optional["Surface"] = ...,
     ) -> tuple[bool, Optional[np.ndarray]]: ...
+    def read0(
+        self,
+        w: Optional[int] = ...,
+        h: Optional[int] = ...,
+        fmt: Optional[str] = ...,
+    ) -> tuple[bool, Optional[DecodedFrame]]: ...
     def release(self) -> None: ...
     def __enter__(self) -> "VideoCapture": ...
+    def __exit__(self, *exc) -> None: ...
+
+
+class VideoWriter:
+    CODEC_H264: str
+    CODEC_MJPEG: str
+    CODEC_MP4V: str
+
+    PROFILE_BASELINE: str
+    PROFILE_MAIN: str
+    PROFILE_HIGH: str
+
+    RC_VBR: str
+    RC_CBR: str
+    RC_FIXQP: str
+    RC_AVBR: str
+
+    width: int
+    height: int
+    fps: int
+    bitrate: int
+    gop: int
+    codec: str
+    profile: str
+    isOpened: bool
+
+    def __init__(
+        self,
+        path: str,
+        fps: int = ...,
+        frame_size: tuple[int, int] = ...,
+        *,
+        codec: str = ...,
+        profile: str = ...,
+        bitrate: int = ...,
+        gop: int = ...,
+        bframes: int = ...,
+        rc_mode: str = ...,
+    ) -> None: ...
+    def write(self, frame: np.ndarray | "DecodedFrame") -> None: ...
+    backend: str  # "mpp" | "pyav" | "ws-jpeg"
+    def release(self) -> None: ...
+    def __enter__(self) -> "VideoWriter": ...
     def __exit__(self, *exc) -> None: ...
 
 

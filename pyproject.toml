@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rkv"
-version = "0.1.1"
+version = "0.2.0"
 description = "Python bindings for Rockchip MPP / RGA2 / V4L2: hardware video decode and 2D acceleration"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,8 +25,8 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Multimedia :: Video",
 ]
-# 第三方 Python 依赖。VideoCapture 路径（av/numpy/v4l2）只会在显式
-# import rkv.video / rkv.media 时触发；纯 import rkv 不会强制装这些。
+# 第三方 Python 依赖。VideoCapture / VideoWriter 路径（av/numpy/v4l2）
+# 只会在显式 import rkv.video / rkv.encoder 时触发；纯 import rkv 不会强制装这些。
 dependencies = [
     "av>=10.0",
     "numpy>=1.20",

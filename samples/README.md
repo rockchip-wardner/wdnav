@@ -15,6 +15,8 @@
 | 文件 | 演示内容 |
 | --- | --- |
 | `video_decoder.py` | 单路 H.264/H.265 硬件解码 + cv2 显示 |
+| `video_writer.py` | 合成 BGR 帧 → MPP 硬编 / PyAV libx264 / ``rkv+ws://`` 写 MP4 |
+| `video_capture_writer.py` | ``VideoCapture`` 读 → ``VideoWriter`` 写的端到端转码样例 |
 | `multi_decoder.py` | 4 路并行解码 + cv2 拼成 2×2 田字格 |
 | `camera_capture.py` | `/dev/videoX` 摄像头捕获 |
 | `mali_surfaceless_smoke.py` | SurfaceFlinger 纯 GL 烟雾测试, 不依赖 VideoCapture |
@@ -22,3 +24,8 @@
 | `mali_multi_decoder.py` | 4 路 video 在 SurfaceFlinger 上做 2×2 网格 GPU 合成 |
 | `dmaheap_demo.py` | `/dev/dma_heap/` 分配, mmap, sync_read 演示 |
 | `egl_import_diagnostic.py` | 用 rbs/glengine 同款属性表跑 eglCreateImageKHR, 判定 libmali 是否支持 DMA-BUF 零拷贝 |
+
+> **依赖说明**：核心库 `rkv` 现在**完全不再依赖 cv2** —— 编解码走 MPP+PyAV，
+> 显示用的 sample 仍然 `import cv2` 做窗口（``opencv-python`` 是可选依赖，
+> 不影响库本身）。`video_writer.py` / `video_capture_writer.py` 是
+> 不需要 cv2 的；其他几个 sample 需要 `pip install opencv-python` 才能跑。

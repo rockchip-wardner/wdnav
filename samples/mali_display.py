@@ -7,11 +7,11 @@ Demonstrates the compositor with two stacked surfaces:
   BGR ndarray, which we copy into :attr:`Surface.latest_ndarray` and
   hand to the worker thread via :meth:`Surface.post`). This is the
   software path; the zero-copy DMA-BUF path is also wired up — see
-  :meth:`VideoCapture.read` ``to=`` parameter — but requires a libmali
-  build that actually accepts general dma-buf fds through
-  ``EGL_EXT_image_dma_buf_import``. Some X11/wayland libmali builds
-  advertise the extension without honouring it; this sample uses the
-  BGR path because it works on every build.
+  :meth:`VideoCapture.read0` followed by :meth:`Surface.post_fd` —
+  but requires a libmali build that actually accepts general dma-buf
+  fds through ``EGL_EXT_image_dma_buf_import``. Some X11/wayland libmali
+  builds advertise the extension without honouring it; this sample uses
+  the BGR path because it works on every build.
 * the **OSD** plane is rendered via :attr:`Surface.latest_ndarray` and
   :meth:`Surface.post` so the same path is exercised in software.
 
@@ -70,10 +70,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--zero-copy",
         action="store_true",
         help=(
-            "Use the DMA-BUF zero-copy path: ``cap.read(to=plan1)`` posts "
-            "the VPU-decoded fd straight into the Surface. Requires a "
-            "libmali build whose EGL_EXT_image_dma_buf_import actually "
-            "accepts general dma-buf fds."
+            "Use the DMA-BUF zero-copy path: ``cap.read0()`` returns the "
+            "VPU-decoded ``DecodedFrame`` and we post its fd straight into "
+            "the Surface via :meth:`Surface.post_fd`. Requires a libmali "
+            "build whose EGL_EXT_image_dma_buf_import actually accepts "
+            "general dma-buf fds."
         ),
     )
     return parser
@@ -99,7 +100,10 @@ def main(args) -> int:
 
     while True:
         if args.zero_copy:
-            ret, _ = cap.read(to=plan1)
+            ret, frame0 = cap.read0()
+            if ret and frame0 is not None and frame0.fd >= 0:
+                stride = frame0.hor_stride or frame0.width
+                plan1.post_fd(frame0.fd, pts=int(frame0.pts or 0), stride=stride)
         else:
             ret, frame = cap.read(args.width, args.height)
             if ret and frame is not None:

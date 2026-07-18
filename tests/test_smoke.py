@@ -20,6 +20,7 @@ def test_public_api_exports():
     for name in (
         "__version__",
         "VideoCapture",
+        "VideoWriter",
         "MediaDevice",
         "MediaEntity",
         "MediaLink",
@@ -37,8 +38,9 @@ def test_public_api_exports():
 def test_conditional_symbols_are_either_class_or_none():
     # ``VideoCapture``、``MediaDevice``、``SurfaceFlinger``、``Surface``、
     # ``DmaHeap``、``DmaBuf`` 在 native 缺失时是 None，否则是真类。两者都
-    # 属预期。
+    # 属预期。``VideoWriter`` 依赖 cv2，缺 cv2 时同样退化为 None。
     assert rkv.VideoCapture is None or isinstance(rkv.VideoCapture, type)
+    assert rkv.VideoWriter is None or isinstance(rkv.VideoWriter, type)
     assert rkv.MediaDevice is None or isinstance(rkv.MediaDevice, type)
     assert rkv.SurfaceFlinger is None or isinstance(rkv.SurfaceFlinger, type)
     assert rkv.Surface is None or isinstance(rkv.Surface, type)

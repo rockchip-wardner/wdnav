@@ -44,8 +44,8 @@ from ctypes import (
     c_uint64,
     c_void_p,
 )
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Library loading
@@ -150,6 +150,15 @@ class MppBufferType:
     EXT_DMA = 2
     DRM = 3
     DMA_HEAP = 4
+    # Flag bits in the upper 16 bits — match rk_mpp_buffer.h
+    # ``MPP_BUFFER_FLAGS_*`` constants. Combine with type via ``|``:
+    # ``MppBufferType.DRM | MppBufferType.FLAG_CACHABLE``.
+    FLAG_CONTIG = 0x00010000
+    FLAG_CACHABLE = 0x00020000
+    FLAG_WC = 0x00040000
+    FLAG_SECURE = 0x00080000
+    FLAG_KMAP = 0x00100000
+    FLAG_DMA32 = 0x00200000
 
 
 class MppBufferMode:
@@ -182,6 +191,38 @@ class MpiCmd:
     DEC_SET_OUTPUT_FORMAT = 0x0031000A
     DEC_SET_CFG = 0x00310201
     DEC_GET_CFG = 0x00310202
+
+    # MPP_ENC_* command codes reconstructed from rk_mpi_cmd.h. The bit
+    # layout is:
+    #   bit 20-23 module id   (CODEC = 0x00300000)
+    #   bit 16-19 ctx id      (DEC    = 0x00010000, ENC = 0x00020000)
+    #   bit  8-15 cfg id      (QUERY  = 0x00000100, CFG  = 0x00000200)
+    #   bit  0- 7 command id  (1-based, auto-incremented from CMD_*_BASE)
+    #
+    # MPP_ENC_CMD_BASE = 0x00320000, then enum auto-increments:
+    #   0x01 SET_CFG  0x02 GET_CFG  0x03 SET_PREP_CFG ...
+    #   0x07 SET_CODEC_CFG  0x08 GET_CODEC_CFG
+    #   0x09 SET_IDR_FRAME
+    #   0x0A SET_OSD_LEGACY_0 ... 0x0C SET_OSD_LEGACY_2
+    #   0x0D GET_HDR_SYNC
+    # MPP_ENC_CFG_MISC (separate block) holds SET_HEADER_MODE / GET_HEADER_MODE.
+    # Header-mode control is intentionally not bound — we let MPP use its
+    # default behaviour (emit SPS/PPS at first IDR) and rely on
+    # MPP_ENC_GET_HDR_SYNC to fetch the blob once.
+    ENC_SET_CFG = 0x00320201
+    ENC_GET_CFG = 0x00320202
+    ENC_SET_IDR_FRAME = 0x00320009
+    ENC_GET_HDR_SYNC = 0x0032000D
+
+
+# Header (SPS/PPS/VPS) emission mode for MPP_ENC_SET_HEADER_MODE.
+# Values match rk_venc_cfg.h / MppEncHeaderMode. Not currently used by
+# rkv — exposed for callers that need to suppress per-IDR headers (rare).
+class MppEncHeaderMode:
+    DEFAULT = 0     # encoder decides
+    NO_HEADER = 1   # suppress SPS/PPS — useful for live streams that send
+                    # the configuration once at open time
+    EACH_IDR = 2    # emit SPS/PPS before every IDR (good for seeking)
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +325,9 @@ _lib.mpp_check_support_format.restype = MPP_RET
 _lib.mpp_packet_init.argtypes = [POINTER(MppPacket), c_void_p, c_size_t]
 _lib.mpp_packet_init.restype = MPP_RET
 
+_lib.mpp_packet_init_with_buffer.argtypes = [POINTER(MppPacket), MppBuffer]
+_lib.mpp_packet_init_with_buffer.restype = MPP_RET
+
 _lib.mpp_packet_deinit.argtypes = [POINTER(MppPacket)]
 _lib.mpp_packet_deinit.restype = MPP_RET
 
@@ -307,6 +351,24 @@ _lib.mpp_packet_set_eos.restype = MPP_RET
 
 _lib.mpp_packet_get_pts.argtypes = [MppPacket]
 _lib.mpp_packet_get_pts.restype = RK_S64
+
+# Read-side accessors used by the encoder wrapper (read out encoded NALs).
+_lib.mpp_packet_get_pos.argtypes = [MppPacket]
+_lib.mpp_packet_get_pos.restype = c_void_p
+
+_lib.mpp_packet_get_length.argtypes = [MppPacket]
+_lib.mpp_packet_get_length.restype = c_size_t
+
+_lib.mpp_packet_get_flag.argtypes = [MppPacket]
+_lib.mpp_packet_get_flag.restype = RK_U32
+
+# Packet flag bits from rk_mpp_packet.h / mpp_packet.h. We only need the
+# intra-frame marker here; the other bits (REF / DISPLAY / CORRUPT / END)
+# aren't surfaced to Python callers.
+MPP_PACKET_FLAG_INTRA = 1 << 0
+
+_lib.mpp_packet_get_eos.argtypes = [MppPacket]
+_lib.mpp_packet_get_eos.restype = RK_U32
 
 
 # MppFrame
@@ -333,11 +395,36 @@ _lib.mpp_frame_get_dts.restype = RK_S64
 _lib.mpp_frame_get_buffer.restype = MppBuffer
 
 
+# Encoder-side frame setters. We only bind what the encoder driver
+# actually consumes (size / format / buffer / pts / dts).
+for _name in (
+    "set_width", "set_height",
+    "set_hor_stride", "set_ver_stride",
+    "set_fmt", "set_pts", "set_dts",
+    "set_buffer", "set_buf_size",
+    "set_eos",
+):
+    _fn = getattr(_lib, f"mpp_frame_{_name}")
+    _fn.argtypes = [MppFrame, RK_U32]
+    if _name == "set_buffer":
+        _fn.argtypes = [MppFrame, MppBuffer]
+    elif _name == "set_pts" or _name == "set_dts":
+        _fn.argtypes = [MppFrame, RK_S64]
+    _fn.restype = None if _name != "set_eos" else MPP_RET
+
+
 # MppBuffer
 _lib.mpp_buffer_get_with_tag.argtypes = [
     MppBufferGroup, POINTER(MppBuffer), c_size_t, c_char_p, c_char_p,
 ]
 _lib.mpp_buffer_get_with_tag.restype = MPP_RET
+
+# Single-export ``mpp_buffer_get_with_tag`` is the only ``*_get`` callable
+# from the .so — the public ``mpp_buffer_get`` name is a macro that
+# calls ``mpp_buffer_get_with_tag(group, buf, size, MODULE_TAG, __FUNCTION__)``
+# at the C level, so we drive the latter directly. ``mpp_buffer_put`` is
+# similarly macro-only; the underlying export is
+# ``mpp_buffer_put_with_caller``.
 
 _lib.mpp_buffer_put_with_caller.argtypes = [MppBuffer, c_char_p]
 _lib.mpp_buffer_put_with_caller.restype = MPP_RET
@@ -345,8 +432,24 @@ _lib.mpp_buffer_put_with_caller.restype = MPP_RET
 _lib.mpp_buffer_get_ptr_with_caller.argtypes = [MppBuffer, c_char_p]
 _lib.mpp_buffer_get_ptr_with_caller.restype = c_void_p
 
+_lib.mpp_buffer_get_size_with_caller.argtypes = [MppBuffer, c_char_p]
+_lib.mpp_buffer_get_size_with_caller.restype = c_size_t
+
 _lib.mpp_buffer_get_fd_with_caller.argtypes = [MppBuffer, c_char_p]
 _lib.mpp_buffer_get_fd_with_caller.restype = c_int
+
+# External-DMA-BUF import. ``mpp_buffer_import_with_tag`` wraps a
+# caller-owned fd (e.g. the DMA-BUF handed back by the MPP decoder)
+# as an MppBuffer so the encoder can read from it without copying
+# through a userspace malloc buffer. The buffer's reference count
+# stays at 1; the caller is responsible for keeping the underlying
+# DMA-BUF alive (the ``MppBuffer`` handle inherits its lifetime from
+# the file descriptor).
+_lib.mpp_buffer_import_with_tag.argtypes = [
+    MppBufferGroup, POINTER(MppBufferInfo), POINTER(MppBuffer),
+    c_char_p, c_char_p,
+]
+_lib.mpp_buffer_import_with_tag.restype = MPP_RET
 
 # Cache-coherency ops: required if a CPU wants to read or write a DMA
 # buffer (the VPU writes through DMA, which doesn't invalidate the CPU
@@ -405,6 +508,45 @@ _lib.mpp_dec_cfg_get_u32.restype = MPP_RET
 
 
 # ---------------------------------------------------------------------------
+# MppEncCfg — generic key/value configuration store for the encoder. Used
+# via ``MPP_ENC_SET_CFG`` / ``MPP_ENC_GET_CFG``. Same calling shape as
+# MppDecCfg but the keys are different (e.g. ``prep:width``, ``rc:gop``).
+# ---------------------------------------------------------------------------
+
+_lib.mpp_enc_cfg_init.argtypes = [POINTER(c_void_p)]
+_lib.mpp_enc_cfg_init.restype = MPP_RET
+
+_lib.mpp_enc_cfg_deinit.argtypes = [c_void_p]
+_lib.mpp_enc_cfg_deinit.restype = MPP_RET
+
+for _enc_fn in ("set_u8", "set_u16", "set_u32", "set_u64"):
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f.argtypes = [c_void_p, c_char_p, c_uint32]
+    _f.restype = MPP_RET
+for _enc_fn in ("set_s8", "set_s16", "set_s32", "set_s64"):
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f.argtypes = [c_void_p, c_char_p, c_int32]
+    _f.restype = MPP_RET
+for _enc_fn in ("set_st", "set_ptr"):
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f.argtypes = [c_void_p, c_char_p, c_void_p]
+    _f.restype = MPP_RET
+
+for _enc_fn in ("get_u8", "get_u16", "get_u32", "get_u64"):
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f.argtypes = [c_void_p, c_char_p, POINTER(c_uint32)]
+    _f.restype = MPP_RET
+for _enc_fn in ("get_s8", "get_s16", "get_s32", "get_s64"):
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f.argtypes = [c_void_p, c_char_p, POINTER(c_int32)]
+    _f.restype = MPP_RET
+for _enc_fn in ("get_st", "get_ptr"):
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f.argtypes = [c_void_p, c_char_p, c_void_p]
+    _f.restype = MPP_RET
+
+
+# ---------------------------------------------------------------------------
 # High-level helpers
 # ---------------------------------------------------------------------------
 
@@ -431,6 +573,116 @@ CODING_BY_NAME = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Format / conversion helpers — shared between ``DecodedFrame.numpy`` and the
+# eager ``VideoCapture.read`` path. Putting them here keeps the mapping
+# definitions (MPP-format → RGA-format and the user-facing format names)
+# next to the MPP decoder that emits ``fmt`` codes.
+# ---------------------------------------------------------------------------
+
+
+# MPP frame-format codes we accept on the RGA input side. Maps directly
+# onto the rga.h surface-format enum (left-shifted by 8): 0 = NV12,
+# 4 = I420, 5 = NV21.
+_MPP_TO_RGA_FMT = {
+    0: "YCbCr_420_SP",
+    4: "YCbCr_420_P",
+    5: "YCrCb_420_SP",
+}
+_MPP_TO_RGA_NAME = {0: "NV12", 4: "I420", 5: "NV21"}
+
+
+# Map the short names users pass to ``numpy(fmt=...)`` /
+# ``VideoCapture.read(fmt=...)`` to the RgaFormat constant plus
+# buffer-layout metadata. ``layout`` is one of:
+#   ``"HWC"``  — packed pixel (BGR/RGB/BGRA/RGBA); shape ``(H, W, C)``.
+#   ``"YUV"``  — NV12/NV21 full buffer; shape ``(H * 3 // 2, W)`` (Y plane
+#                + interleaved UV at offset H*W).
+#   ``"GRAY"`` — single-channel luma from a NV12 RGA pass; shape ``(H, W)``.
+_OUTPUT_FORMAT_BY_NAME = {
+    # 8-bit packed pixel formats
+    "BGR":     ("BGR_888",      3,   "HWC"),
+    "BGR888":  ("BGR_888",      3,   "HWC"),
+    "RGB":     ("RGB_888",      3,   "HWC"),
+    "RGB888":  ("RGB_888",      3,   "HWC"),
+    # 8-bit packed pixel + alpha
+    "BGRA":    ("BGRA_8888",    4,   "HWC"),
+    "BGRA8888": ("BGRA_8888",   4,   "HWC"),
+    "RGBA":    ("RGBA_8888",    4,   "HWC"),
+    "RGBA8888": ("RGBA_8888",   4,   "HWC"),
+    # 8-bit YUV 4:2:0 semi-planar (RGA writes full Y + interleaved UV)
+    "NV12":    ("YCbCr_420_SP", 1.5, "YUV"),
+    "NV21":    ("YCrCb_420_SP", 1.5, "YUV"),
+    # Luma-only via RGA's native YUV400 format (single channel, 1 BPP).
+    "GRAY":    ("YCbCr_400",    1,   "GRAY"),
+    "GREY":    ("YCbCr_400",    1,   "GRAY"),
+    "Y":       ("YCbCr_400",    1,   "GRAY"),
+}
+
+
+def _resolve_output_format(fmt: Optional[str]) -> Tuple[int, float, str]:
+    """Return ``(rga_format, bytes_per_pixel, layout)`` for ``fmt``.
+
+    ``None`` or empty string defaults to BGR_888 packed pixels. The
+    RGA format code is resolved at call time (lazy) because importing
+    ``rkv.rga`` at module-load time would force the rga ctypes layer
+    to load before the user has had a chance to mock it for tests.
+    """
+    from . import rga
+
+    if not fmt:
+        return rga.RgaFormat.BGR_888, 3, "HWC"
+    try:
+        rga_attr, bpp, layout = _OUTPUT_FORMAT_BY_NAME[fmt.upper()]
+    except KeyError as e:
+        raise ValueError(
+            f"unknown output format {fmt!r}; supported: "
+            f"{sorted(_OUTPUT_FORMAT_BY_NAME)}"
+        ) from e
+    return getattr(rga.RgaFormat, rga_attr), bpp, layout
+
+
+def _rga_input_format(fmt: int) -> int:
+    """Resolve an MPP ``fmt`` code to its RGA input format constant."""
+    from . import rga
+
+    try:
+        attr = _MPP_TO_RGA_FMT[fmt]
+    except KeyError as e:
+        raise RuntimeError(
+            f"MPP frame format {fmt} is not supported by RGA input; "
+            f"supported: {sorted(_MPP_TO_RGA_NAME.values())}"
+        ) from e
+    return getattr(rga.RgaFormat, attr)
+
+
+def _as_ndarray(
+    buf_storage,
+    width: int,
+    height: int,
+    bpp: float,
+    layout: str,
+) -> "np.ndarray":
+    """Reshape an RGA output buffer into the right ndarray view.
+
+    ``layout`` is one of ``"HWC"`` (packed pixels), ``"YUV"`` (full
+    NV12 / NV21 plane), or ``"GRAY"`` (single-channel luma extracted
+    from the Y plane of a NV12 RGA pass). For 1.5-BPP layouts we
+    expose the full buffer; for 1-BPP we slice off the Y plane (the
+    first H*W bytes of the NV12 layout) so the returned ndarray is
+    exactly ``(H, W)``.
+    """
+    import numpy as np
+
+    raw = np.frombuffer(buf_storage, dtype=np.uint8)
+    if layout == "YUV":
+        return raw.reshape(height * 3 // 2, width)
+    if layout == "GRAY":
+        return raw[: height * width].reshape(height, width)
+    channels = int(round(bpp))
+    return raw.reshape(height, width, channels)
+
+
 @dataclass
 class DecodedFrame:
     """A decoded frame returned by :class:`MppDecoder`.
@@ -446,6 +698,11 @@ class DecodedFrame:
     *before* touching the memory, and :func:`mpp_buffer_sync_cpu_write`
     *after* any write — the wrapper does that automatically for the
     built-in code paths.
+
+    Call :meth:`numpy` to materialise the frame into a contiguous ndarray
+    via RGA2 — that gives the same result as the eager
+    :meth:`rkv.VideoCapture.read` path without touching the CPU between
+    MPP and RGA.
     """
 
     width: int
@@ -458,6 +715,108 @@ class DecodedFrame:
     fd: int            # DMA-BUF fd of the MppBuffer; -1 if not available
     buf_size: int      # size of the MppBuffer in bytes
     raw: "MppFrame"    # underlying MppFrame handle (c_void_p), for advanced users
+
+    # Per-call output overrides set by :meth:`rkv.VideoCapture.read0` and
+    # consumed as defaults by :meth:`numpy`. ``None`` means "use the
+    # source's native size / BGR". Calling :meth:`numpy` with explicit
+    # overrides always wins.
+    out_w: Optional[int] = None
+    out_h: Optional[int] = None
+    out_fmt: Optional[str] = None
+
+    def numpy(
+        self,
+        w: Optional[int] = None,
+        h: Optional[int] = None,
+        fmt: Optional[str] = None,
+    ) -> "np.ndarray":
+        """Materialise this frame into a contiguous ndarray via RGA2.
+
+        Mirrors :meth:`rkv.VideoCapture.read` so callers can write
+        either::
+
+            ret, frame = cap.read(w, h, fmt)
+
+        or::
+
+            ret, frame0 = cap.read0(w, h, fmt)
+            frame = frame0.numpy()
+
+        with the same ndarray result. ``w`` / ``h`` resize via RGA in
+        the same hardware pass as the colour conversion; ``fmt``
+        selects the output pixel format (case-insensitive):
+
+        * ``"BGR"`` (default), ``"RGB"``, ``"BGRA"``, ``"RGBA"`` —
+          packed pixels, shape ``(H, W, C)``.
+        * ``"NV12"``, ``"NV21"`` — full YUV420 buffer, shape
+          ``(H * 3 // 2, W)``. The interleaved UV plane sits at offset
+          ``H * W``.
+        * ``"GRAY"`` / ``"GREY"`` / ``"Y"`` — single-channel luma, shape
+          ``(H, W)``.
+
+        Args explicitly passed here override the ``out_w`` / ``out_h`` /
+        ``out_fmt`` stashed by :meth:`rkv.VideoCapture.read0`; either of
+        them being ``None`` falls back to the stashed value, which in
+        turn defaults to ``None`` (= source size, BGR).
+        """
+        import ctypes
+
+        from . import rga
+
+        # Lazy numpy import — keeps mpp.py usable in environments without
+        # numpy (rare, but the ctypes layer is the primary dependency).
+        import numpy as np
+
+        target_w = w if w else self.out_w
+        target_h = h if h else self.out_h
+        target_fmt_name = fmt if fmt else self.out_fmt
+
+        input_fmt = _rga_input_format(self.fmt)
+        target_fmt, bpp, layout = _resolve_output_format(target_fmt_name)
+        target_w = target_w or self.width
+        target_h = target_h or self.height
+
+        hor_stride = self.hor_stride or self.width
+        ver_stride = self.ver_stride or self.height
+
+        if self.fd is not None and self.fd >= 0:
+            src = rga.wrap_fd(
+                self.fd, self.width, self.height, input_fmt,
+                wstride=hor_stride, hstride=ver_stride,
+            )
+        else:
+            src = rga.wrap_virtual(
+                self.ptr, self.width, self.height, input_fmt,
+                wstride=hor_stride, hstride=ver_stride,
+            )
+
+        # RGA wants a destination stride aligned to 16 bytes; the visible
+        # region may be smaller than the allocated buffer, so we trim
+        # it back after the conversion.
+        rga_w = (target_w + 15) & ~15
+        bpp_target = rga.bytes_per_pixel(target_fmt)
+        size = -(-int(rga_w * target_h * bpp_target) // 1)  # ceil
+        buf_storage = (ctypes.c_uint8 * size)()
+        dst = rga.wrap_virtual(
+            ctypes.addressof(buf_storage), rga_w, target_h, target_fmt,
+        )
+        try:
+            if (target_w, target_h) == (self.width, self.height) or layout != "HWC":
+                rga.cvtcolor(src, dst)
+            else:
+                rga.resize(src, dst)
+            rga.flush()
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"RGA cannot convert {_MPP_TO_RGA_NAME.get(self.fmt, self.fmt)} "
+                f"{self.width}x{self.height} to "
+                f"{rga.format_name(target_fmt)} {target_w}x{target_h}: {e}"
+            ) from e
+
+        out = _as_ndarray(buf_storage, rga_w, target_h, bpp, layout)
+        if rga_w != target_w:
+            out = out[:, :target_w]
+        return out
 
 
 class MppDecoder:
@@ -780,6 +1139,640 @@ class MppDecoder:
 
 
 # ---------------------------------------------------------------------------
+# MppEncoder — hardware H.264 / HEVC encoder wrapper.
+#
+# Mirrors the structure of the upstream ``mpi_enc_test.c`` reference. Each
+# ``encode(bgr)`` call wraps the input BGR ndarray in an MppFrame, hands it
+# to MPP via ``encode_put_frame``, and yields back the encoded NAL packet(s)
+# via ``encode_get_packet``. The raw NAL bytes are produced in Annex B
+# format (start-code prefixed) which downstream container muxers can
+# convert to avcC if needed.
+# ---------------------------------------------------------------------------
+
+
+# Rate-control modes from rk_venc_rc.h. Mirrors ``MppEncRcMode``; only the
+# bits we actually surface are listed.
+class MppEncRcMode:
+    CBR = 0       # constant bitrate
+    VBR = 1       # variable bitrate
+    FIXQP = 2     # constant QP (no rate control)
+    AVBR = 4      # adaptive VBR
+
+
+# Profile codes from rk_venc_cmd.h / avcC's ``profile_idc`` byte.
+_H264_PROFILE_BY_NAME = {
+    "baseline": 66,
+    "main": 77,
+    "high": 100,
+}
+
+
+@dataclass
+class EncodedPacket:
+    """One encoded access unit returned by :meth:`MppEncoder.encode`.
+
+    ``data`` is the raw NAL bytes in Annex B format (one or more
+    ``00 00 00 01``-prefixed NAL units — MPP typically packs the slice
+    data after the slice header). ``is_keyframe`` is ``True`` for I/P-
+    frames emitted after a GOP boundary or explicit ``force_idr``; both
+    mp4 muxer and pyrkaiweb WS sink use it to mark keyframe entries
+    so consumers can seek into them.
+    """
+
+    data: bytes
+    pts: int
+    is_keyframe: bool
+
+
+class MppEncoder:
+    """Thin ctypes wrapper around MPP's hardware video encoder.
+
+    Mirrors the ``MppDecoder`` API: ``__init__`` configures the encoder
+    via the kcfg-based ``MPP_ENC_SET_CFG`` path (matches the upstream
+    ``mpi_enc_test.c`` reference's newer key-value config interface
+    rather than the legacy ``MppEnc*Cfg`` structs). ``encode(bgr)``
+    takes a ``(H, W, 3)`` uint8 BGR ndarray — the encoder's input
+    format is fixed at :data:`MppFrameFormat.BGR888`, which avoids a
+    CPU-side NV12 conversion step before each encode call.
+
+    Parameters
+    ----------
+    coding_type:
+        :data:`MppCodingType.AVC` (H.264, default) or :data:`MppCodingType.HEVC`.
+        H.264 is what most downstream tools (MP4 muxers, browsers,
+        pyrkaiweb ingest) expect.
+    width, height:
+        Frame dimensions in pixels. The encoder allocates input /
+        output buffers sized for these on the first frame.
+    fps:
+        Output frame rate (Hz). Encoded into both the rate-control config
+        (``rc:fps_*``) and the ``video stream`` time base PyAV sees on
+        mux.
+    bitrate:
+        Target bitrate in bps. Surfaces as both ``rc:bps_target`` and
+        the upper bound ``rc:bps_max`` so CBR keeps a tight cap.
+    gop:
+        GOP length in frames. ``1`` = all-IDR (lowest latency, biggest
+        file); ``30`` ≈ 1 second of keyframes at 30 fps.
+    profile:
+        H.264 only. ``"baseline"``, ``"main"``, or ``"high"``. HeVC's
+        profile argument is currently ignored.
+    input_format:
+        Pixel format of the BGR ndarray handed to :meth:`encode`. Only
+        :data:`MppFrameFormat.BGR888` is supported (matches what the
+        rest of rkv emits from the read path).
+    rc_mode:
+        ``"cbr"`` (default), ``"vbr"``, ``"fixqp"``, or ``"avbr"``.
+        Passed straight through to ``rc:mode`` — MPP validates against
+        the platform's encoder capabilities.
+    """
+
+    def __init__(
+        self,
+        coding_type: int = MppCodingType.AVC,
+        *,
+        width: int,
+        height: int,
+        fps: int = 30,
+        bitrate: int = 2_000_000,
+        gop: int = 30,
+        profile: str = "baseline",
+        input_format: int = MppFrameFormat.BGR888,
+        rc_mode: str = "cbr",
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height must be positive")
+        if fps <= 0:
+            raise ValueError("fps must be positive")
+        if coding_type == MppCodingType.AVC and profile not in _H264_PROFILE_BY_NAME:
+            raise ValueError(
+                f"unsupported H.264 profile {profile!r}; expected one of "
+                f"{sorted(_H264_PROFILE_BY_NAME)}"
+            )
+        if rc_mode not in ("cbr", "vbr", "fixqp", "avbr"):
+            raise ValueError(f"unsupported rc_mode {rc_mode!r}")
+        if input_format != MppFrameFormat.BGR888:
+            raise ValueError(
+                "MppEncoder only accepts BGR888 input; pass the BGR ndarray "
+                "directly to encode()."
+            )
+
+        self._coding = coding_type
+        self._width = int(width)
+        self._height = int(height)
+        self._fps = int(fps)
+        self._bitrate = int(bitrate)
+        self._gop = int(gop)
+        self._profile_name = profile
+        self._profile_idc = _H264_PROFILE_BY_NAME.get(profile, 66) if coding_type == MppCodingType.AVC else 0
+        self._rc_mode_name = rc_mode
+        self._input_format = input_format
+        self._hor_stride = self._width
+        self._ver_stride = self._height
+        # 3 bytes per pixel for BGR888.
+        self._frame_buf_size = self._hor_stride * self._ver_stride * 3
+
+        # MPP encoder state.
+        self._ctx: Optional[MppCtx] = None
+        self._api: Optional[POINTER(MppApi)] = None
+        self._buf_group: Optional[MppBufferGroup] = None
+        self._frm_buf: Optional[MppBuffer] = None
+        # A dedicated MppBuffer used as the scratch storage for the
+        # output packet that backs ``MPP_ENC_GET_HDR_SYNC`` (and is
+        # reused for every :meth:`encode` output packet). MPP writes
+        # encoded NAL bytes into this buffer via the MppPacket's
+        # ``pos``/``length`` fields.
+        self._pkt_buf: Optional[MppBuffer] = None
+        # Raw SPS/PPS / VPS bytes returned by MPP_ENC_GET_HDR_SYNC. Annex B
+        # format (start-code prefixed). Downstream code can either pass
+        # these through as-is (for live ingest / rkv+ws://) or convert to
+        # an avcC box (for MP4 muxing).
+        self._extradata: bytes = b""
+        # Lazily-created MppFrame scratch + output packet scratch.
+        self._frame: MppFrame = MppFrame()
+        self._packet: MppPacket = MppPacket()
+        self._pts: int = 0
+        self._force_idr: bool = False
+        self._closed = False
+        self._flushed = False
+
+        # Configure the encoder in the locked section — mpp_create,
+        # mpp_init, and MPP_ENC_SET_CFG all touch global encoder state.
+        with _mpp_lock:
+            self._ctx = MppCtx()
+            self._api = POINTER(MppApi)()
+            _check(_lib.mpp_create(byref(self._ctx), byref(self._api)), "mpp_create")
+            _check(
+                _lib.mpp_init(self._ctx, MppCtxType.ENC, self._coding),
+                "mpp_init",
+            )
+
+            # Set the encoder config via the key-value interface. The
+            # plain ctypes ``set_s32`` calls mirror ``mpi_enc_utils.c``
+            # lines 343-630; missing keys are silently ignored at the
+            # MPP level, so we set only what we care about.
+            cfg = c_void_p()
+            _check(_lib.mpp_enc_cfg_init(byref(cfg)), "mpp_enc_cfg_init")
+            try:
+                _check(
+                    self._api.contents.control(
+                        self._ctx, MpiCmd.ENC_GET_CFG, cfg
+                    ),
+                    "MPP_ENC_GET_CFG",
+                )
+                _cfg = _lib.mpp_enc_cfg_set_s32
+                _cfg(cfg, b"prep:width", self._width)
+                _cfg(cfg, b"prep:height", self._height)
+                _cfg(cfg, b"prep:hor_stride", self._hor_stride)
+                _cfg(cfg, b"prep:ver_stride", self._ver_stride)
+                _cfg(cfg, b"prep:format", int(self._input_format))
+                _cfg(cfg, b"prep:range", 2)  # 2 = full-range; matches CV output
+                if coding_type == MppCodingType.AVC:
+                    _cfg(cfg, b"h264:profile", self._profile_idc)
+                    _cfg(cfg, b"h264:level", 41)  # 4.1 covers 1080p@30
+                _cfg(cfg, b"rc:mode", getattr(MppEncRcMode, rc_mode.upper()))
+                _cfg(cfg, b"rc:bps_target", self._bitrate)
+                _cfg(cfg, b"rc:bps_max", self._bitrate)
+                _cfg(cfg, b"rc:bps_min", self._bitrate // 4)
+                _cfg(cfg, b"rc:fps_in_num", self._fps)
+                _cfg(cfg, b"rc:fps_in_denom", 1)
+                _cfg(cfg, b"rc:fps_in_flex", 0)
+                _cfg(cfg, b"rc:fps_out_num", self._fps)
+                _cfg(cfg, b"rc:fps_out_denom", 1)
+                _cfg(cfg, b"rc:fps_out_flex", 0)
+                _cfg(cfg, b"rc:gop", self._gop)
+                _check(
+                    self._api.contents.control(
+                        self._ctx, MpiCmd.ENC_SET_CFG, cfg
+                    ),
+                    "MPP_ENC_SET_CFG",
+                )
+            finally:
+                _lib.mpp_enc_cfg_deinit(cfg)
+
+            # Allocate one input frame buffer (reused per encode). DRM+CACHABLE
+            # buffers are what the upstream ``mpi_enc_test.c`` uses and
+            # what the VPU expects on RK3588 / RK3568 / etc.; the kernel
+            # ``drm`` driver backs them with contiguous CMA memory that
+            # the encoder's DMA path can consume without a CPU-side
+            # bounce buffer. NORMAL buffers go through ``allocator_std``
+            # which recent MPP versions mark simulation-only.
+            self._buf_group = MppBufferGroup()
+            _check(
+                _lib.mpp_buffer_group_get(
+                    byref(self._buf_group),
+                    MppBufferType.DRM | MppBufferType.FLAG_CACHABLE,
+                    MppBufferMode.INTERNAL,
+                    b"rkv-mpp",
+                    b"rkv-encoder-frm",
+                ),
+                "mpp_buffer_group_get",
+            )
+            self._frm_buf = MppBuffer()
+            _check(
+                _lib.mpp_buffer_get_with_tag(
+                    self._buf_group,
+                    byref(self._frm_buf),
+                    self._frame_buf_size,
+                    b"rkv-mpp",
+                    b"rkv-encoder-frm",
+                ),
+                "mpp_buffer_get_with_tag frame buffer",
+            )
+            # Output NAL storage. Sized to comfortably hold one coded
+            # access unit at the configured bitrate (peak NAL ~ 64 KiB
+            # for a 1080p frame at 60 Mbps — be generous).
+            self._pkt_buf = MppBuffer()
+            _check(
+                _lib.mpp_buffer_get_with_tag(
+                    self._buf_group,
+                    byref(self._pkt_buf),
+                    256 * 1024,
+                    b"rkv-mpp",
+                    b"rkv-encoder-pkt",
+                ),
+                "mpp_buffer_get_with_tag packet buffer",
+            )
+
+            # Pull SPS/PPS / VPS out of the encoder so callers can stash
+            # them as the codec's extradata. MPP writes the whole NAL
+            # blob into the packet — Annex B start codes included.
+            # The packet must be backed by an explicit MppBuffer; the
+            # bare ``mpp_packet_init(NULL, 0)`` form segfaults on this
+            # MPP version, so we reuse the encoder's output scratch
+            # buffer.
+            tmp_pkt = MppPacket()
+            _check(
+                _lib.mpp_packet_init_with_buffer(byref(tmp_pkt), self._pkt_buf),
+                "mpp_packet_init_with_buffer (HDR_SYNC)",
+            )
+            try:
+                _lib.mpp_packet_set_length(tmp_pkt, 0)
+                ret = self._api.contents.control(
+                    self._ctx, MpiCmd.ENC_GET_HDR_SYNC, tmp_pkt
+                )
+                if ret != 0:
+                    raise RuntimeError(
+                        f"MPP_ENC_GET_HDR_SYNC failed: ret={ret}"
+                    )
+                pos = _lib.mpp_packet_get_pos(tmp_pkt)
+                length = _lib.mpp_packet_get_length(tmp_pkt)
+                if pos and length:
+                    self._extradata = ctypes.string_at(pos, length)
+            finally:
+                _lib.mpp_packet_deinit(byref(tmp_pkt))
+
+    # -- public properties ---------------------------------------------------
+
+    @property
+    def width(self) -> int:
+        return self._width
+
+    @property
+    def height(self) -> int:
+        return self._height
+
+    @property
+    def fps(self) -> int:
+        return self._fps
+
+    @property
+    def bitrate(self) -> int:
+        return self._bitrate
+
+    @property
+    def gop(self) -> int:
+        return self._gop
+
+    @property
+    def profile(self) -> str:
+        return self._profile_name
+
+    @property
+    def rc_mode(self) -> str:
+        return self._rc_mode_name
+
+    @property
+    def extradata(self) -> bytes:
+        """SPS / PPS / VPS blob in Annex B format (``00 00 00 01`` start codes).
+
+        MP4 muxers normally want this as an avcC box; downstream
+        :class:`VideoWriter` does that conversion via the
+        ``_annexb_to_avcC`` helper.
+        """
+        return self._extradata
+
+    def force_keyframe(self) -> None:
+        """Make the next ``encode()`` call an IDR frame (keyframe)."""
+        self._force_idr = True
+
+    # -- context manager ----------------------------------------------------
+
+    def __enter__(self) -> "MppEncoder":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with _mpp_lock:
+            if self._frm_buf:
+                _lib.mpp_buffer_put_with_caller(self._frm_buf, b"rkv-mpp")
+                self._frm_buf = MppBuffer()
+            if self._pkt_buf:
+                _lib.mpp_buffer_put_with_caller(self._pkt_buf, b"rkv-mpp")
+                self._pkt_buf = MppBuffer()
+            if self._buf_group:
+                _lib.mpp_buffer_group_put(self._buf_group)
+                self._buf_group = MppBufferGroup()
+            if self._ctx:
+                _lib.mpp_destroy(self._ctx)
+                self._ctx = MppCtx()
+
+    # -- encode entry point -------------------------------------------------
+
+    def encode(self, frame_bgr: "np.ndarray") -> EncodedPacket:
+        """Submit one BGR ndarray to the encoder and block until the
+        matching encoded packet is available.
+
+        *frame_bgr* must be ``(H, W, 3)`` ``uint8`` with the same width
+        / height passed to the constructor. Shape and dtype are
+        validated; an asynchronous MPP error (typically BUFFER_FULL
+        on the input queue) raises ``RuntimeError``.
+
+        The encoder is single-threaded and synchronous: one ``encode``
+        call in, one :class:`EncodedPacket` out. If you want to keep
+        the encoder busy across multiple frame producers, serialise
+        ``encode`` calls yourself with a lock.
+        """
+        import numpy as np
+
+        if self._closed:
+            raise RuntimeError("MppEncoder is closed")
+        if self._flushed:
+            raise RuntimeError("MppEncoder is already flushed")
+        if (
+            frame_bgr.ndim != 3
+            or frame_bgr.shape[0] != self._height
+            or frame_bgr.shape[1] != self._width
+            or frame_bgr.shape[2] != 3
+            or frame_bgr.dtype != np.uint8
+        ):
+            raise ValueError(
+                f"frame must be ({self._height}, {self._width}, 3) uint8, "
+                f"got shape={frame_bgr.shape} dtype={frame_bgr.dtype}"
+            )
+        if not frame_bgr.flags.c_contiguous:
+            frame_bgr = np.ascontiguousarray(frame_bgr)
+
+        with _mpp_lock:
+            # Optionally request an IDR for this frame.
+            if self._force_idr:
+                _check(
+                    self._api.contents.control(
+                        self._ctx, MpiCmd.ENC_SET_IDR_FRAME, None
+                    ),
+                    "MPP_ENC_SET_IDR_FRAME",
+                )
+                self._force_idr = False
+
+            # Wrap the BGR data in an MppFrame that points at our
+            # pre-allocated NORMAL buffer.
+            buf_ptr = _lib.mpp_buffer_get_ptr_with_caller(
+                self._frm_buf, b"rkv-mpp"
+            )
+            if not buf_ptr:
+                raise RuntimeError("MppEncoder: failed to get buffer pointer")
+            ctypes.memmove(buf_ptr, frame_bgr.ctypes.data, self._frame_buf_size)
+            # CPU wrote to the buffer — flush so DMA can read it
+            # coherently. NORMAL buffers are CPU-malloc-backed, so this
+            # is a plain cache flush (no DMA cache to worry about).
+            try:
+                mpp_buffer_sync_cpu_write(self._frm_buf)
+            except RuntimeError:
+                pass  # some lib versions emit "not implemented" here
+
+            _lib.mpp_frame_init(byref(self._frame))
+            try:
+                _lib.mpp_frame_set_width(self._frame, self._width)
+                _lib.mpp_frame_set_height(self._frame, self._height)
+                _lib.mpp_frame_set_hor_stride(self._frame, self._hor_stride)
+                _lib.mpp_frame_set_ver_stride(self._frame, self._ver_stride)
+                _lib.mpp_frame_set_fmt(self._frame, int(self._input_format))
+                _lib.mpp_frame_set_pts(self._frame, self._pts)
+                _lib.mpp_frame_set_buffer(self._frame, self._frm_buf)
+                ret = self._api.contents.encode_put_frame(self._ctx, self._frame)
+                if ret != 0:
+                    raise RuntimeError(f"encode_put_frame failed: ret={ret}")
+            finally:
+                _lib.mpp_frame_deinit(byref(self._frame))
+                self._frame = MppFrame()
+
+            self._pts += 1
+
+            # Drain the output packet. ``encode_get_packet`` blocks
+            # internally until a packet is available (or errors), so
+            # one call is enough — no polling loop needed. As with
+            # HDR_SYNC, the packet must be backed by an explicit
+            # MppBuffer; reusing ``self._pkt_buf`` here keeps the
+            # call hot-path allocation-free.
+            _check(
+                _lib.mpp_packet_init_with_buffer(byref(self._packet), self._pkt_buf),
+                "mpp_packet_init_with_buffer (output)",
+            )
+            try:
+                _lib.mpp_packet_set_length(self._packet, 0)
+                ret = self._api.contents.encode_get_packet(
+                    self._ctx, byref(self._packet)
+                )
+                if ret != 0:
+                    raise RuntimeError(f"encode_get_packet failed: ret={ret}")
+                pos = _lib.mpp_packet_get_pos(self._packet)
+                length = _lib.mpp_packet_get_length(self._packet)
+                flag = _lib.mpp_packet_get_flag(self._packet)
+                data = ctypes.string_at(pos, length) if length else b""
+                is_keyframe = bool(flag & MPP_PACKET_FLAG_INTRA)
+                pts_out = _lib.mpp_packet_get_pts(self._packet)
+            finally:
+                _lib.mpp_packet_deinit(byref(self._packet))
+                self._packet = MppPacket()
+
+        return EncodedPacket(data=data, pts=pts_out, is_keyframe=is_keyframe)
+
+    def encode_external_fd(
+        self,
+        fd: int,
+        width: int,
+        height: int,
+        hor_stride: int,
+        ver_stride: int,
+        input_format: int = MppFrameFormat.YUV420SP,
+        pts: int = 0,
+    ) -> EncodedPacket:
+        """Encode one externally-owned DMA-BUF frame, **zero-copy**.
+
+        Imports the given ``fd`` as an :class:`MppBuffer` via
+        ``mpp_buffer_import_with_tag`` so MPP can read from the
+        caller-owned DMA-BUF directly — no CPU-side memmove, no
+        malloc scratch buffer. The caller is responsible for keeping
+        the DMA-BUF alive until encoding completes; the
+        :class:`MppBuffer` returned by the import takes a reference
+        on the underlying fd, so as long as the imported buffer
+        isn't ``put``-back too early, the encoder sees valid data.
+
+        The ``width`` / ``height`` / ``hor_stride`` / ``ver_stride``
+        / ``input_format`` arguments describe the buffer's layout
+        (the DMA-BUF might be larger than the visible frame, so
+        strides are mandatory). ``input_format`` defaults to NV12
+        (``MppFrameFormat.YUV420SP``) — the output format of the
+        MPP decoder, which is what the typical ``read0() →
+        write(frame0) → encode_external_fd`` pipeline produces.
+
+        The encoder's *output* format is H.264 by default; the
+        input format and the output format are independent.
+        """
+        if self._closed:
+            raise RuntimeError("MppEncoder is closed")
+        if self._flushed:
+            raise RuntimeError("MppEncoder is already flushed")
+        if fd is None or fd < 0:
+            raise ValueError(f"invalid fd {fd!r}")
+        if width <= 0 or height <= 0 or hor_stride <= 0 or ver_stride <= 0:
+            raise ValueError(
+                f"width/height/hor_stride/ver_stride must all be positive; "
+                f"got {width}x{height} {hor_stride}x{ver_stride}"
+            )
+
+        with _mpp_lock:
+            # Optionally request an IDR for this frame.
+            if self._force_idr:
+                _check(
+                    self._api.contents.control(
+                        self._ctx, MpiCmd.ENC_SET_IDR_FRAME, None
+                    ),
+                    "MPP_ENC_SET_IDR_FRAME",
+                )
+                self._force_idr = False
+
+            # Import the external DMA-BUF fd as an MppBuffer. We pass
+            # ``group = NULL`` so the imported buffer attaches to the
+            # encoder's default internal group rather than the
+            # encoder's pre-allocated NORMAL one. This lets MPP hand
+            # the same DMA-BUF to the encoder via the kernel's
+            # ``dma_buf`` path without any CPU round-trip.
+            info = MppBufferInfo()
+            info.fd = fd
+            info.size = hor_stride * ver_stride * 3 // 2  # NV12 worst case
+            info.type = MppBufferType.DMA_HEAP
+            ext_buf = MppBuffer()
+            _check(
+                _lib.mpp_buffer_import_with_tag(
+                    None, byref(info), byref(ext_buf),
+                    b"rkv-mpp", b"rkv-encoder-ext",
+                ),
+                "mpp_buffer_import_with_tag",
+            )
+            try:
+                _lib.mpp_frame_init(byref(self._frame))
+                try:
+                    _lib.mpp_frame_set_width(self._frame, width)
+                    _lib.mpp_frame_set_height(self._frame, height)
+                    _lib.mpp_frame_set_hor_stride(self._frame, hor_stride)
+                    _lib.mpp_frame_set_ver_stride(self._frame, ver_stride)
+                    _lib.mpp_frame_set_fmt(self._frame, int(input_format))
+                    _lib.mpp_frame_set_pts(self._frame, pts)
+                    _lib.mpp_frame_set_buffer(self._frame, ext_buf)
+                    ret = self._api.contents.encode_put_frame(
+                        self._ctx, self._frame
+                    )
+                    if ret != 0:
+                        raise RuntimeError(
+                            f"encode_put_frame (external) failed: ret={ret}"
+                        )
+                finally:
+                    _lib.mpp_frame_deinit(byref(self._frame))
+                    self._frame = MppFrame()
+
+                # Drain the encoded packet (same path as the eager
+                # ``encode`` method).
+                _check(
+                    _lib.mpp_packet_init_with_buffer(
+                        byref(self._packet), self._pkt_buf
+                    ),
+                    "mpp_packet_init_with_buffer (external output)",
+                )
+                try:
+                    _lib.mpp_packet_set_length(self._packet, 0)
+                    ret = self._api.contents.encode_get_packet(
+                        self._ctx, byref(self._packet)
+                    )
+                    if ret != 0:
+                        raise RuntimeError(
+                            f"encode_get_packet (external) failed: ret={ret}"
+                        )
+                    pos = _lib.mpp_packet_get_pos(self._packet)
+                    length = _lib.mpp_packet_get_length(self._packet)
+                    flag = _lib.mpp_packet_get_flag(self._packet)
+                    data = ctypes.string_at(pos, length) if length else b""
+                    is_keyframe = bool(flag & MPP_PACKET_FLAG_INTRA)
+                    pts_out = _lib.mpp_packet_get_pts(self._packet)
+                finally:
+                    _lib.mpp_packet_deinit(byref(self._packet))
+                    self._packet = MppPacket()
+            finally:
+                # Release the imported MppBuffer. The underlying DMA-BUF
+                # is unaffected (the kernel keeps a ref via the fd).
+                _lib.mpp_buffer_put_with_caller(ext_buf, b"rkv-mpp")
+
+        return EncodedPacket(data=data, pts=pts_out, is_keyframe=is_keyframe)
+
+    def flush(self) -> Optional[EncodedPacket]:
+        """Send an EOS frame to the encoder and pull the final packet.
+
+        Returns the last :class:`EncodedPacket` produced before EOS, or
+        ``None`` if the encoder had nothing queued. After this returns
+        the encoder cannot encode any more frames.
+        """
+        if self._closed:
+            raise RuntimeError("MppEncoder is closed")
+        if self._flushed:
+            return None
+        self._flushed = True
+        with _mpp_lock:
+            _lib.mpp_frame_init(byref(self._frame))
+            try:
+                _lib.mpp_frame_set_eos(self._frame)
+                ret = self._api.contents.encode_put_frame(self._ctx, self._frame)
+                if ret != 0:
+                    raise RuntimeError(f"encode_put_frame (EOS) failed: ret={ret}")
+            finally:
+                _lib.mpp_frame_deinit(byref(self._frame))
+                self._frame = MppFrame()
+
+            ret = self._api.contents.encode_get_packet(
+                self._ctx, byref(self._packet)
+            )
+            if ret != 0:
+                return None
+            try:
+                pos = _lib.mpp_packet_get_pos(self._packet)
+                length = _lib.mpp_packet_get_length(self._packet)
+                flag = _lib.mpp_packet_get_flag(self._packet)
+                data = ctypes.string_at(pos, length) if length else b""
+                is_keyframe = bool(flag & MPP_PACKET_FLAG_INTRA)
+                pts_out = _lib.mpp_packet_get_pts(self._packet)
+            finally:
+                _lib.mpp_packet_deinit(byref(self._packet))
+                self._packet = MppPacket()
+            return EncodedPacket(
+                data=data, pts=pts_out, is_keyframe=is_keyframe
+            )
+
+
+# ---------------------------------------------------------------------------
 # YUV (NV12) → BGR helper — purely for convenience in test/demo code.
 # ---------------------------------------------------------------------------
 
@@ -919,10 +1912,14 @@ __all__ = [
     "MppCtxType",
     "MppCodingType",
     "MppDecoder",
+    "MppEncoder",
+    "MppEncHeaderMode",
+    "MppEncRcMode",
     "MppFrameFormat",
     "MpiCmd",
     "CODING_BY_NAME",
     "DecodedFrame",
+    "EncodedPacket",
     "avcc_to_annexb",
     "parse_avcc_extradata",
     "nv12_to_bgr",
