@@ -7,13 +7,29 @@ MPP / RGA / V4L2 / DmaHeap / GPU Python binding (import name `rkv`, distribution
 
 ## Repo map (one-line each)
 
-- `src/rkv/__init__.py` — public API surface; conditional VideoCapture /
-  MediaDevice import.
+- `src/rkv/__init__.py` — public API surface; conditional `VideoCapture` /
+  `VideoWriter` / `MediaDevice` / `SurfaceFlinger` / `DmaHeap` import so
+  `import rkv` never hard-fails on a dev box missing native libs.
 - `src/rkv/_version.py` — single source of truth for `__version__`.
-- `src/rkv/video.py`, `mpp.py`, `rga.py` — Rockchip MPP + RGA2 decoder.
-  Only loaded via `import rkv.video` (or implicitly through VideoCapture).
-- `src/rkv/media.py`, `v4l2.py` — `media-ctl` parser and v4l2 helpers used
-  by the camera capture sample.
+- `src/rkv/video.py` — `VideoCapture` (MPP decoder + RGA colour-conversion,
+  `read()` / `read0()` zero-copy DMA-BUF handle).
+- `src/rkv/mpp.py` — ctypes bindings to `librockchip_mpp`; `MppEncoder`,
+  `MppDecoder`, `EncodedPacket`, `DecodedFrame` (and the format /
+  helper maps they share).
+- `src/rkv/rga.py` — ctypes bindings to `librga`; colour-conversion
+  + resize helpers used by `DecodedFrame.numpy`.
+- `src/rkv/encoder.py` — `VideoWriter` (MPP hardware H.264 + PyAV
+  mp4v / mjpeg muxing; no cv2, no libx264 fallback). Also hosts the
+  `rkv+ws://` WebSocket sink (JPEG + H.264 via MPP).
+- `src/rkv/surfaceflinger.py` — `SurfaceFlinger` / `Surface` (EGL +
+  Mali GLES compositor for displaying decoded frames).
+- `src/rkv/mali.py` — Mali GPU / EGL helpers backing `SurfaceFlinger`.
+- `src/rkv/media.py` — `media-ctl` topology parser used by the
+  camera-capture sample.
+- `src/rkv/v4l2.py` — V4L2 capture helpers (the upstream
+  `python-v4l2` shim, loaded lazily only when `/dev/video*` is opened).
+- `src/rkv/dmaheap.py` — `DmaHeap` / `RkDmaBuf` DMA-BUF allocators
+  (`/dev/dma_heap/*` and Rockchip GEM ioctl respectively).
 - `src/rkv/rkv.pyi` + `py.typed` — type stubs (PEP 561).
 - `samples/` — runnable examples, no `test_` prefix on filenames.
 - `tests/` — `test_smoke.py` only, import-only, never requires `.so`.
@@ -47,3 +63,7 @@ out.write(frame)  # 兼容cv2的numpy格式frame，一般来说格式是BGR
 out.write(frame0)  # 0拷贝接口，传入dmabuffer结构体
 ```
 
+## 重要提示
+
+- 用中文回答
+- 不要私自提交git commit
