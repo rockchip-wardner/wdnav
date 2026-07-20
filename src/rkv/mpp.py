@@ -218,10 +218,9 @@ class MpiCmd:
     ENC_SET_IDR_FRAME = 0x00320009
     ENC_GET_HDR_SYNC = 0x0032000D
     # Activate a rate-control implementation. Without this call the rc ctx
-    # has ``api = NULL``, so per-frame paths like ``rc_frm_check_drop``
-    # fall through to the inline drop math and trip ``fps_*_denom >= 1``
-    # asserts on Rockchip firmware (mpi_enc_utils.c calls it right after
-    # ``MPP_ENC_SET_CFG`` for H.264 / H.265).
+    # has no implementation bound, so per-frame paths trip
+    # ``fps_*_denom >= 1`` asserts on Rockchip firmware for H.264 / H.265
+    # right after ``MPP_ENC_SET_CFG``.
     ENC_SET_RC_API_CURRENT = 0x00320205
     # ``MPP_ENC_SET_HEADER_MODE`` lives in the MISC sub-block
     # (``MPP_ENC_CFG_MISC`` = CMD_MODULE_CODEC | CMD_CTX_ID_ENC |
@@ -398,7 +397,7 @@ _lib.mpp_packet_get_flag.restype = RK_U32
 # Packet flag bits from rk_mpp_packet.h / mpp_packet.h. We only need the
 # intra-frame marker here; the other bits (REF / DISPLAY / CORRUPT / END)
 # aren't surfaced to Python callers.
-MPP_PACKET_FLAG_INTRA = 1 << 4   # 0x10 — see mpp/mpp/base/inc/mpp_packet_impl.h:25
+MPP_PACKET_FLAG_INTRA = 1 << 4   # bit 4 of the packet flag word
 # (the previous definition had this as ``1 << 0`` which silently classified
 # every IDR as a delta, so the WS sink never sent a ``PKT_TYPE_KEY`` and
 # the WebCodecs decoder stayed forever in pre-IDR state → black screen.)
@@ -1351,10 +1350,9 @@ class MppEncoder:
                 "mpp_init",
             )
 
-            # Set the encoder config via the key-value interface. The
-            # plain ctypes ``set_s32`` calls mirror ``mpi_enc_utils.c``
-            # lines 343-630; missing keys are silently ignored at the
-            # MPP level, so we set only what we care about.
+            # Set the encoder config via the key-value interface. Missing
+            # keys are silently ignored at the MPP level, so we set only
+            # what we care about.
             cfg = c_void_p()
             _check(_lib.mpp_enc_cfg_init(byref(cfg)), "mpp_enc_cfg_init")
             try:
@@ -1385,14 +1383,12 @@ class MppEncoder:
                 _cfg(cfg, b"rc:fps_out_denom", 1)
                 _cfg(cfg, b"rc:fps_out_flex", 0)
                 _cfg(cfg, b"rc:gop", self._gop)
-                # Drop-frame knobs and rc tuning — mirror mpi_enc_test /
-                # mpi_enc_utils.c lines 1870-1876. Drop-mode is disabled
-                # by default in the reference; super_mode / max_reenc_times
-                # are forced off too. These are belt-and-braces — the
-                # critical missing call is ``MPP_ENC_SET_RC_API_CURRENT``
-                # below; without it the rc ctx has ``api = NULL`` and the
-                # per-frame ``rc_frm_check_drop`` path asserts fps_*_denom
-                # even when our kcfg values are correct.
+                # Drop-frame knobs and rc tuning. Drop-mode is disabled by default;
+                # super_mode / max_reenc_times are forced off too. These
+                # are belt-and-braces — the critical missing call is
+                # ``MPP_ENC_SET_RC_API_CURRENT`` below; without it the rc
+                # ctx has no implementation bound and the per-frame paths
+                # assert fps_*_denom even when our kcfg values are correct.
                 _cfg(cfg, b"rc:drop_mode", 0)        # MPP_ENC_RC_DROP_FRM_DISABLED
                 _cfg(cfg, b"rc:max_reenc_times", 0)
                 _cfg(cfg, b"rc:super_mode", 0)
@@ -1405,13 +1401,11 @@ class MppEncoder:
                     "MPP_ENC_SET_CFG",
                 )
 
-                # Bind an rc implementation for AVC / HEVC. mpi_enc_utils.c
-                # does this right after SET_CFG for the same reason: without
-                # it ``MppRcImpl::api`` stays NULL and per-frame paths
-                # (``rc_frm_check_drop`` etc.) fall through to the inline
-                # drop math, which asserts ``fps_*_denom >= 1`` even when
-                # our kcfg is correct. ``name = b"default"`` selects the
-                # stock RC; ``smart`` is opt-in via cmd-line flag.
+                # Bind an rc implementation for AVC / HEVC. Without this the rc
+                # context has no implementation bound and per-frame paths
+                # assert ``fps_*_denom >= 1`` even when our kcfg is
+                # correct. ``name = b"default"`` selects the stock RC;
+                # ``smart`` is opt-in via cmd-line flag.
                 if coding_type in (MppCodingType.AVC, MppCodingType.HEVC):
                     name_buf = b"default\0"
                     brief = RcApiBrief()
