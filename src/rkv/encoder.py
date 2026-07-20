@@ -244,9 +244,9 @@ class VideoWriter:
         ``"h264"`` (default, MPP hardware only — requires a
         Rockchip SoC; raises on non-MPP platforms), ``"mjpeg"``
         (Motion JPEG in AVI, PyAV software), ``"mp4v"`` (MPEG-4
-        Part 2 in MP4, PyAV software). The WS sink uses ``"mjpeg"``
-        by default; ``"h264"`` selects the H.264 wire format
-        described in :mod:`rkv.encoder`'s module docstring.
+        Part 2 in MP4, PyAV software). ``"h264"`` selects the 
+        H.264 wire format described in :mod:`rkv.encoder`'s module 
+        docstring.
     profile:
         H.264 profile: ``"baseline"`` (default, no B-frames, lowest
         latency), ``"main"``, ``"high"``. Recorded; the backend
@@ -519,7 +519,15 @@ class VideoWriter:
                 bitrate=self._bitrate,
                 gop=self._gop,
                 profile=self._profile_name,
-                rc_mode=self._rc_mode.lower(),
+                # H.264 over the WS sink is fixed to CBR — the "default"
+                # rc preset we bind below doesn't reliably produce IDR
+                # frames under VBR on this firmware, which leaves the
+                # browser decoder stuck waiting for its first keyframe
+                # (manifesting as a black screen). CBR's narrower rate
+                # range keeps the preset happy. ``mjpeg`` skips MPP
+                # entirely (PyAV software path) and uses FIXQP for
+                # deterministic per-frame quality.
+                rc_mode="fixqp" if self._codec == self.CODEC_MJPEG else "cbr",
             )
         except Exception as e:
             raise RuntimeError(
@@ -751,10 +759,47 @@ class VideoWriter:
         payload, _ = _strip_annexb(pkt.data)
         if not payload:
             return
-        pkt_type = PKT_TYPE_KEY if pkt.is_keyframe else PKT_TYPE_DELTA
+        # ``pkt.is_keyframe`` comes from the MPP packet flag, but on the
+        # firmware shipped with this build the flag is consistently
+        # zero (the H.264 HAL only sets the EOS / EXTRA_DATA bits; intra
+        # lives in the H.264 NAL type). Parse the access unit we just
+        # length-prefixed: an IDR NAL (type 5) is a key frame, a
+        # trailing-slice NAL (type 1) is a delta. Anything else
+        # (SPS/PPS/AUD filler) inherits the previous classification so
+        # a key SPS that's queued just before its IDR slice stays on
+        # the same type as the slice that follows.
+        pkt_type = self._classify_nal(payload) or (
+            PKT_TYPE_KEY if pkt.is_keyframe else PKT_TYPE_DELTA
+        )
         self._ws_sink.send_packet(
             pkt_type, payload, pts_us=self._ws_pts_us
         )
+
+    @staticmethod
+    def _classify_nal(length_prefixed: bytes) -> int:
+        """Return ``PKT_TYPE_KEY`` / ``PKT_TYPE_DELTA`` / ``0`` for a
+        4-byte-length-prefixed H.264 access unit. ``0`` means "no
+        slice header in here" (pure SPS / PPS / filler), in which case
+        the caller should fall back to the previous classification."""
+        off = 0
+        while off + 4 <= len(length_prefixed):
+            nal_len = int.from_bytes(
+                length_prefixed[off:off + 4], "big"
+            )
+            if nal_len <= 0 or off + 4 + nal_len > len(length_prefixed):
+                return 0
+            nal = length_prefixed[off + 4:off + 4 + nal_len]
+            off += 4 + nal_len
+            if not nal:
+                continue
+            nal_type = nal[0] & 0x1F
+            # 5 = Coded slice of IDR picture (key frame)
+            # 7 = SPS, 8 = PPS, 9 = AUD, etc. — leave to caller
+            if nal_type == 5:
+                return PKT_TYPE_KEY
+            if nal_type in (1, 2, 3, 4):
+                return PKT_TYPE_DELTA
+        return 0
 
     def _mpp_encode_ws(self, frame, is_decoded_frame: bool):
         """Submit one frame to the MPP encoder for the WS path.

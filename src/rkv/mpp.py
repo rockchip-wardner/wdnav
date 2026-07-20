@@ -206,23 +206,43 @@ class MpiCmd:
     #   0x0A SET_OSD_LEGACY_0 ... 0x0C SET_OSD_LEGACY_2
     #   0x0D GET_HDR_SYNC
     # MPP_ENC_CFG_MISC (separate block) holds SET_HEADER_MODE / GET_HEADER_MODE.
-    # Header-mode control is intentionally not bound — we let MPP use its
-    # default behaviour (emit SPS/PPS at first IDR) and rely on
-    # MPP_ENC_GET_HDR_SYNC to fetch the blob once.
+    # We ask for ``MPP_ENC_HEADER_MODE_EACH_IDR`` after ``MPP_ENC_SET_CFG``
+    # so every IDR access unit that comes out of the encoder carries
+    # its own SPS/PPS NALs in the bitstream — a downstream
+    # ``VideoDecoder`` can then start decoding from any random
+    # keyframe without having first received the separate avcC
+    # extradata packet that the default mode only emits once at
+    # stream start.
     ENC_SET_CFG = 0x00320201
     ENC_GET_CFG = 0x00320202
     ENC_SET_IDR_FRAME = 0x00320009
     ENC_GET_HDR_SYNC = 0x0032000D
+    # Activate a rate-control implementation. Without this call the rc ctx
+    # has ``api = NULL``, so per-frame paths like ``rc_frm_check_drop``
+    # fall through to the inline drop math and trip ``fps_*_denom >= 1``
+    # asserts on Rockchip firmware (mpi_enc_utils.c calls it right after
+    # ``MPP_ENC_SET_CFG`` for H.264 / H.265).
+    ENC_SET_RC_API_CURRENT = 0x00320205
+    # ``MPP_ENC_SET_HEADER_MODE`` lives in the MISC sub-block
+    # (``MPP_ENC_CFG_MISC`` = CMD_MODULE_CODEC | CMD_CTX_ID_ENC |
+    # CMD_ENC_CFG_MISC = 0x00328000); the first member
+    # (``MPP_ENC_SET_HEADER_MODE``) is the base + 1.
+    ENC_SET_HEADER_MODE = 0x00328001
 
 
 # Header (SPS/PPS/VPS) emission mode for MPP_ENC_SET_HEADER_MODE.
-# Values match rk_venc_cfg.h / MppEncHeaderMode. Not currently used by
-# rkv — exposed for callers that need to suppress per-IDR headers (rare).
+# Values match rk_venc_cmd.h / MppEncHeaderMode. ``EACH_IDR`` is what
+# rkv.VideoWriter asks for when emitting H.264 over the WS sink: every
+# keyframe then carries its own SPS/PPS, so a downstream decoder
+# (WebCodecs ``VideoDecoder``, etc.) can start decoding from any
+# random IDR without first having to wait for the separate avcC
+# extradata packet. ``NO_HEADER`` (bit 1 in the rkv enum, value 1
+# historically) isn't part of the public C enum; the previous rkv
+# definition was wrong and is kept here only because the source
+# value ``0`` corresponds to ``MPP_ENC_HEADER_MODE_DEFAULT``.
 class MppEncHeaderMode:
-    DEFAULT = 0     # encoder decides
-    NO_HEADER = 1   # suppress SPS/PPS — useful for live streams that send
-                    # the configuration once at open time
-    EACH_IDR = 2    # emit SPS/PPS before every IDR (good for seeking)
+    DEFAULT = 0     # MPP_ENC_HEADER_MODE_DEFAULT
+    EACH_IDR = 1    # MPP_ENC_HEADER_MODE_EACH_IDR — see rk_venc_cmd.h:661
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +300,19 @@ _C_DEQUEUE = CFUNCTYPE(MPP_RET, MppCtx, c_int, c_void_p)
 _C_ENQUEUE = CFUNCTYPE(MPP_RET, MppCtx, c_int, c_void_p)
 _C_RESET = CFUNCTYPE(MPP_RET, MppCtx)
 _C_CONTROL = CFUNCTYPE(MPP_RET, MppCtx, c_int, MppParam)
+
+
+class RcApiBrief(Structure):
+    """Mirrors ``RcApiBrief_t`` from mpp_rc_api.h. Pass by reference to
+    ``MPP_ENC_SET_RC_API_CURRENT`` to bind a named rc implementation
+    ("default" / "smart") to the encoder — without this the rc ctx has
+    ``api = NULL`` and per-frame paths trip ``fps_*_denom >= 1``
+    asserts on Rockchip firmware.
+    """
+    _fields_ = [
+        ("name", c_char_p),
+        ("type", c_int32),
+    ]
 
 
 class MppApi(Structure):
@@ -365,7 +398,10 @@ _lib.mpp_packet_get_flag.restype = RK_U32
 # Packet flag bits from rk_mpp_packet.h / mpp_packet.h. We only need the
 # intra-frame marker here; the other bits (REF / DISPLAY / CORRUPT / END)
 # aren't surfaced to Python callers.
-MPP_PACKET_FLAG_INTRA = 1 << 0
+MPP_PACKET_FLAG_INTRA = 1 << 4   # 0x10 — see mpp/mpp/base/inc/mpp_packet_impl.h:25
+# (the previous definition had this as ``1 << 0`` which silently classified
+# every IDR as a delta, so the WS sink never sent a ``PKT_TYPE_KEY`` and
+# the WebCodecs decoder stayed forever in pre-IDR state → black screen.)
 
 _lib.mpp_packet_get_eos.argtypes = [MppPacket]
 _lib.mpp_packet_get_eos.restype = RK_U32
@@ -1150,13 +1186,21 @@ class MppDecoder:
 # ---------------------------------------------------------------------------
 
 
-# Rate-control modes from rk_venc_rc.h. Mirrors ``MppEncRcMode``; only the
-# bits we actually surface are listed.
+# Rate-control modes from rk_venc_rc.h (MppEncRcMode_e). The C enum
+# is positional, starting at VBR=0:
+#   MPP_ENC_RC_MODE_VBR   = 0
+#   MPP_ENC_RC_MODE_CBR   = 1
+#   MPP_ENC_RC_MODE_FIXQP = 2
+#   MPP_ENC_RC_MODE_AVBR  = 3
+#   MPP_ENC_RC_MODE_SMTRC = 4
+# Sending the wrong value here makes the rc preset bail out with
+# fps_in_denom / fps_out_denom assertions and abort() the process.
 class MppEncRcMode:
-    CBR = 0       # constant bitrate
-    VBR = 1       # variable bitrate
+    VBR = 0       # variable bitrate
+    CBR = 1       # constant bitrate
     FIXQP = 2     # constant QP (no rate control)
-    AVBR = 4      # adaptive VBR
+    AVBR = 3      # adaptive VBR
+    SMTRC = 4     # smart rc
 
 
 # Profile codes from rk_venc_cmd.h / avcC's ``profile_idc`` byte.
@@ -1341,12 +1385,64 @@ class MppEncoder:
                 _cfg(cfg, b"rc:fps_out_denom", 1)
                 _cfg(cfg, b"rc:fps_out_flex", 0)
                 _cfg(cfg, b"rc:gop", self._gop)
+                # Drop-frame knobs and rc tuning — mirror mpi_enc_test /
+                # mpi_enc_utils.c lines 1870-1876. Drop-mode is disabled
+                # by default in the reference; super_mode / max_reenc_times
+                # are forced off too. These are belt-and-braces — the
+                # critical missing call is ``MPP_ENC_SET_RC_API_CURRENT``
+                # below; without it the rc ctx has ``api = NULL`` and the
+                # per-frame ``rc_frm_check_drop`` path asserts fps_*_denom
+                # even when our kcfg values are correct.
+                _cfg(cfg, b"rc:drop_mode", 0)        # MPP_ENC_RC_DROP_FRM_DISABLED
+                _cfg(cfg, b"rc:max_reenc_times", 0)
+                _cfg(cfg, b"rc:super_mode", 0)
+                _cfg(cfg, b"rc:drop_thd", 20)
+                _cfg(cfg, b"rc:drop_gap", 1)
                 _check(
                     self._api.contents.control(
                         self._ctx, MpiCmd.ENC_SET_CFG, cfg
                     ),
                     "MPP_ENC_SET_CFG",
                 )
+
+                # Bind an rc implementation for AVC / HEVC. mpi_enc_utils.c
+                # does this right after SET_CFG for the same reason: without
+                # it ``MppRcImpl::api`` stays NULL and per-frame paths
+                # (``rc_frm_check_drop`` etc.) fall through to the inline
+                # drop math, which asserts ``fps_*_denom >= 1`` even when
+                # our kcfg is correct. ``name = b"default"`` selects the
+                # stock RC; ``smart`` is opt-in via cmd-line flag.
+                if coding_type in (MppCodingType.AVC, MppCodingType.HEVC):
+                    name_buf = b"default\0"
+                    brief = RcApiBrief()
+                    brief.name = c_char_p(name_buf)
+                    brief.type = c_int32(coding_type)
+                    _check(
+                        self._api.contents.control(
+                            self._ctx, MpiCmd.ENC_SET_RC_API_CURRENT,
+                            byref(brief),
+                        ),
+                        "MPP_ENC_SET_RC_API_CURRENT",
+                    )
+
+                # Switch header emission to ``MPP_ENC_HEADER_MODE_EACH_IDR``
+                # so every IDR access unit arrives with SPS + PPS NALs
+                # prepended to its bitstream payload. Default mode only
+                # attaches SPS/PPS to the very first frame and shoves
+                # them into a separate avcC extradata packet; with the
+                # default, a downstream decoder that joined mid-stream
+                # never sees the SPS/PPS until the next IDR (which
+                # might be gop_len frames away) and renders black until
+                # then. EACH_IDR makes every keyframe self-contained.
+                if coding_type in (MppCodingType.AVC, MppCodingType.HEVC):
+                    hdr_mode = c_int32(1)        # MPP_ENC_HEADER_MODE_EACH_IDR
+                    _check(
+                        self._api.contents.control(
+                            self._ctx, MpiCmd.ENC_SET_HEADER_MODE,
+                            byref(hdr_mode),
+                        ),
+                        "MPP_ENC_SET_HEADER_MODE",
+                    )
             finally:
                 _lib.mpp_enc_cfg_deinit(cfg)
 
