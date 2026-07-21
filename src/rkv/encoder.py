@@ -68,6 +68,7 @@ accepts NV12 directly without a BGR round-trip.
 """
 from __future__ import annotations
 
+import fractions
 import os
 import socket
 import struct
@@ -100,6 +101,16 @@ PKT_TYPE_EOS = 0xFF
 
 # Default JPEG quality for the rkv+ws:// sink.
 _WS_JPEG_QUALITY = 75
+
+# MPP's MJPEG encoder on the ``cfg-kcfg`` init path (the path we have
+# to use because ``mpp_venc_kcfg_init`` isn't exported in this
+# librockchip_mpp.so build) accumulates internal state across
+# ``encode()`` calls and the input queue fills up after roughly
+# ``_MPP_MJPEG_RECYCLE_EVERY`` frames — ``encode_put_frame`` then
+# blocks indefinitely on ``BUFFER_FULL``. Recreating the encoder
+# clears the queue. The value 6 leaves a 2-frame margin under the
+# observed deadlock threshold.
+_MPP_MJPEG_RECYCLE_EVERY = 6
 
 # H.264 profile codes for avcC configurationRecord:
 #   66  baseline
@@ -286,6 +297,7 @@ class VideoWriter:
         gop: int = 30,
         bframes: int = 0,
         rc_mode: str = "cbr",
+        q_factor: int = 80,
     ) -> None:
         if frame_size[0] <= 0 or frame_size[1] <= 0:
             raise ValueError("frame_size must be positive (W, H)")
@@ -295,6 +307,10 @@ class VideoWriter:
             raise ValueError(f"unsupported profile: {profile!r}")
         if rc_mode not in (self.RC_VBR, self.RC_CBR, self.RC_FIXQP, self.RC_AVBR):
             raise ValueError(f"unsupported rc_mode: {rc_mode!r}")
+        if codec == self.CODEC_MJPEG and not 1 <= q_factor <= 99:
+            raise ValueError(
+                f"q_factor must be in 1..99 for codec={codec!r}, got {q_factor!r}"
+            )
         if gop < 1:
             raise ValueError("gop must be >= 1")
 
@@ -307,13 +323,14 @@ class VideoWriter:
         self._gop = gop
         self._bframes = bframes
         self._rc_mode = rc_mode
+        self._q_factor = q_factor
 
         self._is_open = False
         self._ws_sink: Optional["_WebSocketSink"] = None
         self._container = None
         self._stream = None
         self._ws_pts_us = 0
-        self._backend: str = ""  # "mpp" | "pyav" | "ws-jpeg" | "ws-h264-mpp"
+        self._backend: str = ""  # "mpp" | "mpp-mjpeg" | "pyav" | "ws-jpeg" | "ws-h264-mpp"
 
         if path.startswith("rkv+ws://"):
             self._ws_sink = _WebSocketSink(path)
@@ -332,8 +349,12 @@ class VideoWriter:
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
 
-        # H.264 is MPP-only — there is no software fallback. Other
-        # codecs (mp4v, mjpeg) still go through PyAV.
+        # H.264 is MPP-only — there is no software fallback.
+        # MJPEG on the local-file path also goes through MPP — the
+        # project's design principle is that *all* encoding is MPP, and
+        # PyAV is only used for demux/mux. Each MJPEG packet is a
+        # complete JPEG with SOI/EOI markers, which matches the layout
+        # AVI's MJPEG stream expects.
         if codec == self.CODEC_H264:
             try:
                 self._init_mpp(path)
@@ -345,6 +366,20 @@ class VideoWriter:
                     f"run on Rockchip hardware."
                 ) from e
             self._backend = "mpp"
+            self._is_open = True
+            return
+
+        if codec == self.CODEC_MJPEG:
+            try:
+                self._init_mpp_mjpeg(path, q_factor=q_factor)
+            except Exception as e:
+                raise RuntimeError(
+                    f"rkv.VideoWriter: MJPEG local-file encoding requires "
+                    f"MPP hardware JPEG encoder but MppEncoder.init failed: "
+                    f"{e}. Use codec='mp4v' for an MPEG-4 Part 2 software "
+                    f"path on non-MPP platforms."
+                ) from e
+            self._backend = "mpp-mjpeg"
             self._is_open = True
             return
 
@@ -423,7 +458,11 @@ class VideoWriter:
             rc_mode=self._rc_mode.lower(),
         )
         self._rc_mode_id = rc_mode_map.get(self._rc_mode, MppEncRcMode.CBR)
-        self._pts_us = 0  # microseconds; PyAV time_base = 1/fps seconds
+        # Frame counter — PyAV expects packet PTS in *time-base ticks*,
+        # not microseconds. With ``time_base = 1 / fps`` (seconds), a
+        # PTS of 0 / 1 / 2 / … maps directly to the frame index and
+        # what FFmpeg's muxer (MP4, AVI, …) writes into the index.
+        self._pts = 0
 
         av = _import_av()
         self._container = av.open(path, "w", format="mp4")
@@ -431,10 +470,11 @@ class VideoWriter:
         self._stream.width = self._width
         self._stream.height = self._height
         self._stream.pix_fmt = "yuv420p"
-        self._stream.time_base = self._stream.codec_context.time_base = (
-            1,
-            self._fps,
-        )
+        # PyAV ≥ 12 rejects raw tuples for time_base; ``fractions.Fraction``
+        # carries the ``.numerator`` / ``.denominator`` attributes its
+        # Cython setter reads. Setting only the codec_context is enough
+        # — ``stream.time_base`` auto-derives for mux.
+        self._stream.codec_context.time_base = fractions.Fraction(1, self._fps)
         # SPS/PPS extradata from MPP — store on the codec context so
         # the muxer writes the avc1 atom at the head of the file.
         extradata_annexb = self._encoder.extradata
@@ -443,22 +483,130 @@ class VideoWriter:
             if avcc:
                 self._stream.codec_context.extradata = avcc
 
+    def _init_mpp_mjpeg(self, path: str, *, q_factor: int = 80) -> None:
+        """Open the file for MPP-encoded MJPEG output.
+
+        Sets up:
+
+        * the MPP hardware MJPEG encoder (one independent JPEG per frame),
+        * a PyAV container whose format is taken from the file extension
+          (``.avi`` → ``avi``, ``.mov`` → ``mp4``). AVI is the canonical
+          container for MJPEG streams; PyAV also accepts ``mov``. The
+          stream itself is added with the ``mjpeg`` codec name and a
+          ``yuvj420p`` pix_fmt so the muxer writes the correct
+          ``AVIh`` / ``mjpg`` headers and a sane FourCC.
+
+        No SPS / PPS / VPS to pull — every encoded packet is a self-
+        contained JPEG. The encoder's ``_init_mpp`` extradata handling
+        isn't needed here.
+
+        ``input_format`` defaults to :data:`MppFrameFormat.BGR888` so
+        the eager-BGR write path (``encode(bgr_ndarray)``) works
+        without an extra BGR→NV12 step in Python; the zero-copy
+        decoder-fd path can still override it via
+        :meth:`MppEncoder.encode_external_fd` with ``YUV420SP``.
+        """
+        from .mpp import MppEncoder, MppCodingType, MppFrameFormat
+
+        self._encoder_q_factor = q_factor
+        self._mpp_mjpeg_input_format = MppFrameFormat.BGR888
+        self._make_mpp_mjpeg_encoder()
+
+        av = _import_av()
+        ext = os.path.splitext(path)[1].lstrip(".").lower()
+        container_format = {
+            "avi": "avi",
+            "mov": "mp4",
+            "mp4": "mp4",
+            "mkv": "matroska",
+        }.get(ext)
+        if container_format:
+            self._container = av.open(path, "w", format=container_format)
+        else:
+            # No extension match → fall back to AVI (the canonical MJPEG
+            # container); FFmpeg's mjpeg muxer is reliable there.
+            self._container = av.open(path, "w", format="avi")
+        self._stream = self._container.add_stream("mjpeg", rate=self._fps)
+        self._stream.width = self._width
+        self._stream.height = self._height
+        self._stream.pix_fmt = "yuvj420p"
+        # PyAV ≥ 12 rejects raw tuples for time_base; ``fractions.Fraction``
+        # carries the ``.numerator`` / ``.denominator`` attributes its
+        # Cython setter reads. Setting only the codec_context is enough
+        # — ``stream.time_base`` auto-derives for mux.
+        self._stream.codec_context.time_base = fractions.Fraction(1, self._fps)
+        # Per-MppEncoder frame counter — incremented in ``write`` to
+        # decide when to call :meth:`_recycle_mpp_mjpeg_encoder` on
+        # the next frame. The recycle keeps the encoder's internal
+        # input queue from filling up on builds that don't reset it
+        # between calls. See :meth:`_make_mpp_mjpeg_encoder` for the
+        # full rationale.
+        self._mpp_mjpeg_frame_count = 0
+        # PTS counter that survives encoder recycles — when a new
+        # encoder takes over, its internal ``_pts`` resets to 0 but
+        # the value we hand to PyAV keeps going up so the AVI muxer
+        # doesn't reject non-monotonic PTS.
+        self._mpp_mjpeg_pts = 0
+
+    def _make_mpp_mjpeg_encoder(self) -> None:
+        """(Re)create the underlying :class:`MppEncoder` for MJPEG.
+
+        Called once from :meth:`_init_mpp_mjpeg` and again from
+        :meth:`_recycle_mpp_mjpeg_encoder` every
+        ``_MPP_MJPEG_RECYCLE_EVERY`` frames. The recycle is a
+        workaround for MPP firmware that doesn't free input queue
+        slots between ``encode_get_packet`` calls — after ~8 frames
+        the queue fills up and ``encode_put_frame`` blocks
+        indefinitely on what should be a fast operation. Recreating
+        the encoder clears the queue; callers don't see the swap
+        because the new encoder produces the same MJPEG format.
+        """
+        from .mpp import MppEncoder, MppCodingType
+
+        if getattr(self, "_encoder", None) is not None:
+            try:
+                self._encoder.close()
+            except Exception:
+                pass
+            self._encoder = None
+        self._encoder = MppEncoder(
+            MppCodingType.MJPEG,
+            width=self._width,
+            height=self._height,
+            fps=self._fps,
+            gop=self._gop,
+            input_format=self._mpp_mjpeg_input_format,
+            rc_mode="fixqp",
+            q_factor=self._encoder_q_factor,
+        )
+        # The encoder's own ``_pts`` resets to 0; we keep
+        # ``_mpp_mjpeg_pts`` monotonic so the PyAV packet PTS keeps
+        # going up across recycles. See :meth:`_send_mpp_mjpeg_packet`.
+        self._pts = 0
+
+    def _recycle_mpp_mjpeg_encoder(self) -> None:
+        """Tear down and re-create the MJPEG encoder (workaround for
+        the firmware's input-queue leak — see :meth:`_make_mpp_mjpeg_encoder`).
+        """
+        self._make_mpp_mjpeg_encoder()
+
     def _init_pyav(self, path: str) -> None:
         """Open the file using PyAV's built-in encoders.
 
-        Supports ``mp4v`` (``mpeg4``) and ``mjpeg`` (Motion JPEG).
-        H.264 deliberately isn't routed through this path — it's
-        MPP-only, see :meth:`_init_mpp` and :meth:`_init_ws_h264`.
+        Supports only ``mp4v`` (``mpeg4``). H.264 is MPP-only (see
+        :meth:`_init_mpp`); MJPEG is also MPP-only on the local-file
+        path (see :meth:`_init_mpp_mjpeg`). PyAV's software encoder is
+        reserved for codecs MPP doesn't have an accelerator for.
         """
         av = _import_av()
         codec_map = {
-            self.CODEC_MJPEG: ("mjpeg", "yuvj420p"),
             self.CODEC_MP4V: ("mpeg4", "yuv420p"),
         }
-        if self._codec == self.CODEC_H264:
+        if self._codec in (self.CODEC_H264, self.CODEC_MJPEG):
             raise RuntimeError(
-                "VideoWriter._init_pyav called for H.264 — that path "
-                "should be routed through _init_mpp. This is a bug."
+                f"VideoWriter._init_pyav called for codec={self._codec!r} — "
+                f"that path should be routed through _init_mpp / "
+                f"_init_mpp_mjpeg. This is a bug."
             )
         if self._codec not in codec_map:
             raise ValueError(f"unsupported codec for PyAV path: {self._codec!r}")
@@ -564,15 +712,26 @@ class VideoWriter:
         * a ``(H, W, 3)`` ``uint8`` BGR ndarray — OpenCV-compatible.
           The frame is copied into the encoder's internal buffer
           (1 CPU memmove) and the encoder handles BGR→YUV on-chip.
-        * a :class:`rkv.mpp.DecodedFrame` (zero-copy DMA-BUF).
-          When the MPP hardware backend is active, the DMA-BUF fd
-          is imported as an :class:`MppBuffer` via
-          :meth:`MppEncoder.encode_external_fd` and handed straight
-          to the encoder's VPU. **No CPU-side copy between decode
-          and encode** — the encoded NALs are written by MPP into
-          its own internal scratch buffer that the muxer then
-          drains. Falls back to the BGR-then-encoder path if the
-          encoder can't be configured for the source format.
+        * a :class:`rkv.mpp.DecodedFrame` (zero-copy DMA-BUF). The
+          path depends on the codec:
+
+          - **H.264 (MP4 / WS)** — the DMA-BUF fd is imported as an
+            :class:`MppBuffer` via
+            :meth:`MppEncoder.encode_external_fd` and handed straight
+            to the encoder's VPU. **No CPU-side copy between decode
+            and encode** — the encoded NALs are written by MPP into
+            its own internal scratch buffer that the muxer then
+            drains. Falls back to the BGR-then-encoder path if the
+            encoder can't be configured for the source format.
+          - **MJPEG** — the MJPEG HAL aborts on externally-imported
+            DMA-BUF (``mpp_enc_check_pkt_buf`` assertion on this
+            firmware), so the zero-copy path is skipped. The
+            DecodedFrame is converted to NV12 via RGA in one pass
+            (:meth:`rkv.mpp.DecodedFrame.numpy` with ``fmt="NV12"``)
+            and fed to a YUV420SP-configured MJPEG encoder. The
+            encoder is rebuilt on the first frame if it was
+            initialised for BGR. This is still one RGA pass, no
+            BGR round-trip.
 
         The PyAV software backend (``mp4v`` / ``mjpeg``) always
         operates on a BGR ndarray; a ``DecodedFrame`` input is
@@ -590,16 +749,21 @@ class VideoWriter:
                 self._send_ws_jpeg(frame)
             return
 
+        is_decoded_frame = hasattr(frame, "fd")
+
         # Zero-copy path: input is a DecodedFrame (DMA-BUF fd),
-        # encoder backend is the MPP hardware path. We import the
+        # encoder backend is the MPP H.264 path. We import the
         # decoder's DMA-BUF fd as an MppBuffer and feed it straight
         # to the VPU — no RGA, no memmove, no Python-side allocation
-        # for pixel data.
-        is_decoded_frame = hasattr(frame, "fd")
+        # for pixel data. The MJPEG HAL is excluded: importing an
+        # external DMA-BUF trips ``mpp_enc_check_pkt_buf`` and the
+        # process aborts before the try/except in Python can catch
+        # anything. MJPEG takes the NV12 short path below instead.
         if (
             self._encoder is not None
             and is_decoded_frame
             and getattr(frame, "fd", -1) >= 0
+            and self._backend != "mpp-mjpeg"
         ):
             try:
                 from .mpp import MppFrameFormat
@@ -611,7 +775,7 @@ class VideoWriter:
                     hor_stride=int(frame.hor_stride or frame.width),
                     ver_stride=int(frame.ver_stride or frame.height),
                     input_format=MppFrameFormat.YUV420SP,
-                    pts=int(frame.pts or self._pts_us),
+                    pts=int(frame.pts or self._pts),
                 )
                 self._send_mpp_packet(pkt)
                 return
@@ -627,10 +791,59 @@ class VideoWriter:
                 )
 
         if self._encoder is not None:
-            # MPP hardware path, eager BGR.
-            bgr = self._decoded_frame_to_bgr(frame) if is_decoded_frame else frame
-            pkt = self._encoder.encode(bgr)
-            self._send_mpp_packet(pkt)
+            # MJPEG NV12 short path: take the DecodedFrame's NV12
+            # directly via RGA, switch the encoder to YUV420SP on
+            # first use. Skips the BGR round-trip that
+            # ``_decoded_frame_to_bgr`` would otherwise insert
+            # (BGR→NV12 on the encoder side and NV12→BGR on the RGA
+            # side). The encoder is rebuilt whenever the desired
+            # input format doesn't match — covering both
+            # frame0→BGR and BGR→frame0 transitions in the same
+            # stream — and the periodic ``_recycle_mpp_mjpeg_encoder``
+            # below picks up the new ``_mpp_mjpeg_input_format``
+            # automatically.
+            if self._backend == "mpp-mjpeg":
+                from .mpp import MppFrameFormat as _MJPEG_FMT
+
+                desired_format = (
+                    _MJPEG_FMT.YUV420SP if is_decoded_frame else _MJPEG_FMT.BGR888
+                )
+                if self._mpp_mjpeg_input_format != desired_format:
+                    self._mpp_mjpeg_input_format = desired_format
+                    self._make_mpp_mjpeg_encoder()
+                if is_decoded_frame:
+                    pixels = frame.numpy(fmt="NV12")
+                else:
+                    pixels = frame
+            else:
+                pixels = (
+                    self._decoded_frame_to_bgr(frame)
+                    if is_decoded_frame
+                    else frame
+                )
+            # On the MJPEG backend, recycle the encoder every
+            # ``_MPP_MJPEG_RECYCLE_EVERY`` frames to clear the
+            # firmware's input-queue leak — see the rationale in
+            # :meth:`_make_mpp_mjpeg_encoder`. We recycle *after*
+            # the previous frame has been encoded and muxed, so the
+            # call site is mid-stream and the PTS counter restarts at
+            # 0 for the new encoder. PyAV's AVI / MP4 muxer only
+            # cares about monotonically-increasing PTS, so we patch
+            # it up to keep going from where we left off.
+            if (
+                self._backend == "mpp-mjpeg"
+                and self._mpp_mjpeg_frame_count > 0
+                and self._mpp_mjpeg_frame_count % _MPP_MJPEG_RECYCLE_EVERY == 0
+            ):
+                self._recycle_mpp_mjpeg_encoder()
+            pkt = self._encoder.encode(pixels)
+            if self._backend == "mpp-mjpeg":
+                # MJPEG packets are complete JPEG bitstreams (SOI…EOI)
+                # with no start codes to strip and no NAL structure.
+                self._send_mpp_mjpeg_packet(pkt)
+                self._mpp_mjpeg_frame_count += 1
+            else:
+                self._send_mpp_packet(pkt)
             return
 
         # PyAV software path. Always operate on a BGR ndarray.
@@ -671,6 +884,19 @@ class VideoWriter:
                 self._container = None
                 self._stream = None
             if self._encoder is not None:
+                # MPP MJPEG encoder may have one packet still queued
+                # when the user calls release(); flush it through the
+                # container before tearing down the encoder. ``flush``
+                # is a no-op for H.264 callers too because the encoder
+                # already returned every frame synchronously from
+                # ``encode()``.
+                if self._backend == "mpp-mjpeg":
+                    try:
+                        tail = self._encoder.flush()
+                        if tail is not None and tail.data:
+                            self._send_mpp_mjpeg_packet(tail)
+                    except Exception:
+                        pass
                 try:
                     self._encoder.close()
                 except Exception:
@@ -699,16 +925,54 @@ class VideoWriter:
         payload, _ = _strip_annexb(pkt.data)
         av = _import_av()
         packet = av.Packet(payload)
-        # Time-base: PyAV writes the packet's pts into the MP4 with
-        # stream.codec_context.time_base. Use 1/fps seconds so PTS = frame
-        # index works out.
-        packet.pts = self._pts_us
-        packet.dts = self._pts_us
+        # PTS / DTS are frame indices in ``time_base`` ticks (which is
+        # ``1 / fps`` seconds on this stream). One frame per tick.
+        packet.pts = self._pts
+        packet.dts = self._pts
+        packet.duration = 1
         packet.time_base = self._stream.codec_context.time_base
         packet.stream = self._stream
         self._container.mux(packet)
-        # Use the same per-second tick; one frame per PTS tick.
-        self._pts_us += int(1_000_000 / max(self._fps, 1))
+        self._pts += 1
+
+    def _send_mpp_mjpeg_packet(self, pkt) -> None:
+        """Mux one MJPEG :class:`EncodedPacket` from MPP into the PyAV container.
+
+        MJPEG packets are complete JPEG bitstreams (each starts with
+        ``FF D8`` SOI and ends with ``FF D9`` EOI), so the only thing
+        we have to do is hand them to PyAV with the right timing. There's
+        no NAL unit / start-code processing, no avcC extradata to attach
+        (the JPEG headers themselves travel inside the packet).
+
+        Time-base is ``1 / fps`` (seconds); PTS / DTS are the frame
+        index (0, 1, 2, …) so the AVI muxer writes a sane
+        ``PTS × time_base`` and accepts more than one frame per
+        stream. PyAV's AVI muxer is strict — without an explicit
+        ``time_base`` + ``duration`` it raises ``EINVAL`` on the
+        second packet; without ``is_keyframe=True`` it never
+        populates the index.
+        """
+        if not pkt.data:
+            return
+        av = _import_av()
+        packet = av.Packet(pkt.data)
+        # PTS / DTS are monotonic frame counters across encoder
+        # recycles — PyAV's AVI muxer rejects non-monotonic PTS with
+        # ``EINVAL``. ``self._pts`` (the per-encoder counter) may
+        # reset on recycle; ``self._mpp_mjpeg_pts`` keeps going up
+        # across the whole writer lifetime.
+        packet.pts = self._mpp_mjpeg_pts
+        packet.dts = self._mpp_mjpeg_pts
+        packet.time_base = self._stream.codec_context.time_base
+        packet.duration = 1
+        packet.stream = self._stream
+        # AVI/MJPEG streams expect every packet to be a key frame —
+        # setting ``is_keyframe=True`` makes the muxer write ``K`` flags
+        # in the AVI index so seek / scrub still works on the output.
+        packet.is_keyframe = True
+        self._container.mux(packet)
+        self._pts += 1
+        self._mpp_mjpeg_pts += 1
 
     def _send_ws_jpeg(self, frame) -> None:
         """WS path: software MJPEG encode via PyAV, push as one packet."""

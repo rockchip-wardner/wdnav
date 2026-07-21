@@ -406,6 +406,29 @@ _lib.mpp_packet_get_eos.argtypes = [MppPacket]
 _lib.mpp_packet_get_eos.restype = RK_U32
 
 
+# MppMeta (key/value bag attached to a frame). The encoder uses it to
+# carry the *output* packet pre-allocated by the caller — without that
+# binding the MJPEG encoder's HAL falls back to asking the buffer group
+# for one, which on this firmware reports ``size 0`` and trips the
+# ``mpp_enc_check_pkt_buf`` assertion. The H.264 path can also be
+# driven via meta, but historically our wrapper has used the
+# direct ``encode_get_packet`` API and that still works for H.264.
+MppMeta = c_void_p
+
+MppMetaKey = c_int32
+KEY_OUTPUT_PACKET = (ord('o') << 24) | (ord('p') << 16) | (ord('k') << 8) | ord('t')
+
+_lib.mpp_meta_get_with_tag.argtypes = [
+    POINTER(MppMeta), c_char_p, c_char_p,
+]
+_lib.mpp_meta_get_with_tag.restype = MPP_RET
+_lib.mpp_meta_put.argtypes = [MppMeta]
+_lib.mpp_meta_put.restype = MPP_RET
+_lib.mpp_meta_set_packet.argtypes = [MppMeta, MppMetaKey, MppPacket]
+_lib.mpp_meta_set_packet.restype = MPP_RET
+_lib.mpp_meta_get_packet.argtypes = [MppMeta, MppMetaKey, POINTER(MppPacket)]
+_lib.mpp_meta_get_packet.restype = MPP_RET
+
 # MppFrame
 _lib.mpp_frame_init.argtypes = [POINTER(MppFrame)]
 _lib.mpp_frame_init.restype = MPP_RET
@@ -446,6 +469,15 @@ for _name in (
     elif _name == "set_pts" or _name == "set_dts":
         _fn.argtypes = [MppFrame, RK_S64]
     _fn.restype = None if _name != "set_eos" else MPP_RET
+
+# MppFrame ↔ MppMeta attachment. The encoder reads KEY_OUTPUT_PACKET
+# off the frame's meta when ``encode_put_frame`` is dispatched, so
+# getting the bindings for the setter / getter is required to drive
+# the meta-based encode path (used by the MJPEG encoder).
+_lib.mpp_frame_set_meta.argtypes = [MppFrame, MppMeta]
+_lib.mpp_frame_set_meta.restype = None
+_lib.mpp_frame_get_meta.argtypes = [MppFrame]
+_lib.mpp_frame_get_meta.restype = MppMeta
 
 
 # MppBuffer
@@ -1241,9 +1273,13 @@ class MppEncoder:
     Parameters
     ----------
     coding_type:
-        :data:`MppCodingType.AVC` (H.264, default) or :data:`MppCodingType.HEVC`.
-        H.264 is what most downstream tools (MP4 muxers, browsers,
-        pyrkaiweb ingest) expect.
+        :data:`MppCodingType.AVC` (H.264, default), :data:`MppCodingType.HEVC`,
+        or :data:`MppCodingType.MJPEG` (Motion JPEG). H.264 is what most
+        downstream tools (MP4 muxers, browsers, pyrkaiweb ingest) expect;
+        MJPEG is a hardware path for the ``codec="mjpeg"`` branch of
+        :class:`rkv.VideoWriter` — each frame is encoded as an
+        independent JPEG (no inter-frame coding, no SPS/PPS), which
+        makes it ideal for stills capture and AVI streaming.
     width, height:
         Frame dimensions in pixels. The encoder allocates input /
         output buffers sized for these on the first frame.
@@ -1254,21 +1290,70 @@ class MppEncoder:
     bitrate:
         Target bitrate in bps. Surfaces as both ``rc:bps_target`` and
         the upper bound ``rc:bps_max`` so CBR keeps a tight cap.
+        Ignored when ``coding_type == MppCodingType.MJPEG``.
     gop:
         GOP length in frames. ``1`` = all-IDR (lowest latency, biggest
-        file); ``30`` ≈ 1 second of keyframes at 30 fps.
+        file); ``30`` ≈ 1 second of keyframes at 30 fps. MJPEG ignores
+        this — every frame is a keyframe.
     profile:
-        H.264 only. ``"baseline"``, ``"main"``, or ``"high"``. HeVC's
-        profile argument is currently ignored.
+        H.264 only. ``"baseline"``, ``"main"``, or ``"high"``. HEVC's /
+        MJPEG's profile argument is currently ignored.
     input_format:
-        Pixel format of the BGR ndarray handed to :meth:`encode`. Only
-        :data:`MppFrameFormat.BGR888` is supported (matches what the
-        rest of rkv emits from the read path).
+        Pixel format of the ndarray handed to :meth:`encode`. One of
+        the planar YUV / packed RGB formats MPP's venc accepts:
+
+        * :data:`MppFrameFormat.YUV420SP` — NV12, shape
+          ``(H * 3 // 2, W)``, ``uint8``. Matches the MPP decoder's
+          default output — the zero-copy
+          ``cap.read0().writer.write()`` path lands here. Also the
+          most common input for MJPEG.
+        * :data:`MppFrameFormat.YUV420P` — I420, same shape.
+        * :data:`MppFrameFormat.YUV420SP_VU` — NV21, same shape.
+        * :data:`MppFrameFormat.RGB888` / :data:`MppFrameFormat.BGR888` —
+          shape ``(H, W, 3)``, ``uint8``.
+        * :data:`MppFrameFormat.RGBA` / :data:`MppFrameFormat.BGRA` —
+          shape ``(H, W, 4)``, ``uint8``.
+
+        The encoder will validate shape / dtype at :meth:`encode` time
+        and raise ``ValueError`` on mismatch — it does not perform any
+        BGR↔YUV conversion.
     rc_mode:
         ``"cbr"`` (default), ``"vbr"``, ``"fixqp"``, or ``"avbr"``.
         Passed straight through to ``rc:mode`` — MPP validates against
-        the platform's encoder capabilities.
+        the platform's encoder capabilities. For MJPEG this is forced
+        to ``"fixqp"`` since MJPEG has no rate control beyond the JPEG
+        quantisation tables.
+    q_factor:
+        JPEG quality factor in 1..99, default ``80``. Higher = better
+        quality, larger file. Only takes effect when
+        ``coding_type == MppCodingType.MJPEG``; passing a non-default
+        value with H.264 / HEVC raises ``ValueError``.
     """
+
+    # input_format → (bpp, channels, layout) — used to size the
+    # scratch buffer and to validate the ndarray shape in
+    # :meth:`encode`. Layout is ``"HWC"`` for packed pixels,
+    # ``"YUV"`` for planar/semi-planar.
+    _FORMAT_LAYOUT = {
+        MppFrameFormat.YUV420SP: (1.5, 1, "YUV"),
+        MppFrameFormat.YUV420SP_10BIT: (3.0, 1, "YUV"),
+        MppFrameFormat.YUV422SP: (2.0, 1, "YUV"),
+        MppFrameFormat.YUV420P: (1.5, 1, "YUV"),
+        MppFrameFormat.YUV420SP_VU: (1.5, 1, "YUV"),
+        MppFrameFormat.YUV400: (1.0, 1, "YUV"),
+        MppFrameFormat.RGB888: (3.0, 3, "HWC"),
+        MppFrameFormat.BGR888: (3.0, 3, "HWC"),
+        MppFrameFormat.RGBA: (4.0, 4, "HWC"),
+        MppFrameFormat.BGRA: (4.0, 4, "HWC"),
+    }
+    _YUV_HEIGHT_MULTIPLIER = {
+        MppFrameFormat.YUV420SP: 1.5,
+        MppFrameFormat.YUV420SP_10BIT: 1.5,
+        MppFrameFormat.YUV422SP: 2.0,
+        MppFrameFormat.YUV420P: 1.5,
+        MppFrameFormat.YUV420SP_VU: 1.5,
+        MppFrameFormat.YUV400: 1.0,
+    }
 
     def __init__(
         self,
@@ -1282,6 +1367,7 @@ class MppEncoder:
         profile: str = "baseline",
         input_format: int = MppFrameFormat.BGR888,
         rc_mode: str = "cbr",
+        q_factor: int = 80,
     ) -> None:
         if width <= 0 or height <= 0:
             raise ValueError("width and height must be positive")
@@ -1293,11 +1379,29 @@ class MppEncoder:
                 f"{sorted(_H264_PROFILE_BY_NAME)}"
             )
         if rc_mode not in ("cbr", "vbr", "fixqp", "avbr"):
-            raise ValueError(f"unsupported rc_mode {rc_mode!r}")
-        if input_format != MppFrameFormat.BGR888:
+            raise ValueError(f"unsupported rc_mode: {rc_mode!r}")
+        if input_format not in self._FORMAT_LAYOUT:
             raise ValueError(
-                "MppEncoder only accepts BGR888 input; pass the BGR ndarray "
-                "directly to encode()."
+                f"unsupported input_format {input_format!r}; expected one of "
+                f"{sorted(self._FORMAT_LAYOUT)}"
+            )
+        if coding_type == MppCodingType.MJPEG:
+            # MJPEG ignores ``profile`` / ``bitrate`` / ``rc_mode`` —
+            # it has no inter-frame coding so there's no rate control
+            # in the H.264 sense; quality is controlled solely by the
+            # JPEG ``q_factor`` (1..99). Force ``fixqp`` to match the
+            # upstream ``mpi_enc_utils.c`` default and don't write the
+            # rc:bps_* / rc:fps_* keys — they only confuse the JPEG rc
+            # implementation.
+            if not 1 <= q_factor <= 99:
+                raise ValueError(
+                    f"q_factor must be in 1..99 for MJPEG, got {q_factor!r}"
+                )
+            rc_mode = "fixqp"
+            profile = ""
+        elif q_factor != 80:
+            raise ValueError(
+                "q_factor only applies to MJPEG encoding; ignored otherwise"
             )
 
         self._coding = coding_type
@@ -1309,11 +1413,23 @@ class MppEncoder:
         self._profile_name = profile
         self._profile_idc = _H264_PROFILE_BY_NAME.get(profile, 66) if coding_type == MppCodingType.AVC else 0
         self._rc_mode_name = rc_mode
+        self._q_factor = int(q_factor)
         self._input_format = input_format
+        # ``True`` once ``self._packet`` has been bound to a backing
+        # buffer; the MJPEG path keeps it bound across calls (so it
+        # sits inside the encoder's meta and is updated in place),
+        # while the H.264 path rebinds every :meth:`encode` call.
+        self._packet_bound = False
         self._hor_stride = self._width
         self._ver_stride = self._height
-        # 3 bytes per pixel for BGR888.
-        self._frame_buf_size = self._hor_stride * self._ver_stride * 3
+        # Bytes per frame in the configured input format. Planar YUV
+        # uses height × stride × bpp; packed pixels use the channel count.
+        if input_format in self._YUV_HEIGHT_MULTIPLIER:
+            self._frame_buf_size = int(
+                self._hor_stride * self._ver_stride * self._YUV_HEIGHT_MULTIPLIER[input_format]
+            )
+        else:
+            self._frame_buf_size = int(self._hor_stride * self._ver_stride * 3)
 
         # MPP encoder state.
         self._ctx: Optional[MppCtx] = None
@@ -1372,10 +1488,44 @@ class MppEncoder:
                 if coding_type == MppCodingType.AVC:
                     _cfg(cfg, b"h264:profile", self._profile_idc)
                     _cfg(cfg, b"h264:level", 41)  # 4.1 covers 1080p@30
+                if coding_type == MppCodingType.MJPEG:
+                    # MJPEG has no rate control in the H.264 sense;
+                    # ``q_factor`` (1..99) controls the JPEG quantisation
+                    # tables. ``qf_max`` / ``qf_min`` bound the rate-control
+                    # model's quant range; the upstream ``mpi_enc_utils.c``
+                    # defaults are 99 / 1. Keep them so callers can override
+                    # via ``q_factor`` only and still get sane behaviour.
+                    _cfg(cfg, b"jpeg:q_factor", self._q_factor)
+                    _cfg(cfg, b"jpeg:qf_max", 99)
+                    _cfg(cfg, b"jpeg:qf_min", 1)
                 _cfg(cfg, b"rc:mode", getattr(MppEncRcMode, rc_mode.upper()))
-                _cfg(cfg, b"rc:bps_target", self._bitrate)
-                _cfg(cfg, b"rc:bps_max", self._bitrate)
-                _cfg(cfg, b"rc:bps_min", self._bitrate // 4)
+                # Even in FIXQP mode the JPEG rc model wants a non-zero
+                # bit budget so it can derive quantisation tables. The
+                # upstream ``mpi_enc_utils.c`` sets ``bps_target = w*h*fps*1.5``
+                # (a sanity 8-bit RGB multiplier) for FIXQP and leaves
+                # bps_min / bps_max at zero — match that. Without
+                # bps_target the JPEG HAL falls back to all-ones
+                # quantisation tables, which produces a syntactically
+                # valid but visually-broken JPEG that downstream
+                # decoders reject.
+                if coding_type == MppCodingType.MJPEG:
+                    # ``w*h*fps/8`` matches the upstream
+                    # ``mpi_enc_utils.c`` default for FIXQP MJPEG (a
+                    # 0.125-byte-per-pixel budget) and gives the JPEG
+                    # rc model the right input to derive quantisation
+                    # tables. Higher values push qtables toward 1
+                    # (worse quality, smaller file).
+                    fixqp_bps = max(
+                        self._width * self._height * self._fps // 8,
+                        100_000,
+                    )
+                    _cfg(cfg, b"rc:bps_target", fixqp_bps)
+                    _cfg(cfg, b"rc:bps_max", 0)
+                    _cfg(cfg, b"rc:bps_min", 0)
+                else:
+                    _cfg(cfg, b"rc:bps_target", self._bitrate)
+                    _cfg(cfg, b"rc:bps_max", self._bitrate)
+                    _cfg(cfg, b"rc:bps_min", self._bitrate // 4)
                 _cfg(cfg, b"rc:fps_in_num", self._fps)
                 _cfg(cfg, b"rc:fps_in_denom", 1)
                 _cfg(cfg, b"rc:fps_in_flex", 0)
@@ -1401,12 +1551,18 @@ class MppEncoder:
                     "MPP_ENC_SET_CFG",
                 )
 
-                # Bind an rc implementation for AVC / HEVC. Without this the rc
-                # context has no implementation bound and per-frame paths
-                # assert ``fps_*_denom >= 1`` even when our kcfg is
-                # correct. ``name = b"default"`` selects the stock RC;
-                # ``smart`` is opt-in via cmd-line flag.
-                if coding_type in (MppCodingType.AVC, MppCodingType.HEVC):
+                # Bind an rc implementation for AVC / HEVC / MJPEG. Without
+                # this the rc context has no implementation bound and
+                # per-frame paths assert ``fps_*_denom >= 1`` even when
+                # our kcfg is correct. ``name = b"default"`` selects the
+                # stock RC; ``smart`` is opt-in via cmd-line flag. For
+                # MJPEG the jpege RC implementation is the one that
+                # actually reads ``jpeg:q_factor`` to drive the quant
+                # tables — without this call the encoder produces garbage
+                # / refuses frames.
+                if coding_type in (
+                    MppCodingType.AVC, MppCodingType.HEVC, MppCodingType.MJPEG
+                ):
                     name_buf = b"default\0"
                     brief = RcApiBrief()
                     brief.name = c_char_p(name_buf)
@@ -1428,6 +1584,8 @@ class MppEncoder:
                 # never sees the SPS/PPS until the next IDR (which
                 # might be gop_len frames away) and renders black until
                 # then. EACH_IDR makes every keyframe self-contained.
+                # MJPEG has no SPS/PPS, so the call is a no-op there but
+                # we still skip it for clarity.
                 if coding_type in (MppCodingType.AVC, MppCodingType.HEVC):
                     hdr_mode = c_int32(1)        # MPP_ENC_HEADER_MODE_EACH_IDR
                     _check(
@@ -1501,14 +1659,22 @@ class MppEncoder:
                 ret = self._api.contents.control(
                     self._ctx, MpiCmd.ENC_GET_HDR_SYNC, tmp_pkt
                 )
-                if ret != 0:
+                if coding_type == MppCodingType.MJPEG:
+                    # MJPEG has no SPS/PPS / VPS — every frame is a
+                    # self-contained JPEG. HDR_SYNC returns an error on
+                    # this path (no header to fetch), so swallow it
+                    # rather than raising. ``self._extradata`` stays
+                    # ``b""`` which is what callers should expect.
+                    pass
+                elif ret != 0:
                     raise RuntimeError(
                         f"MPP_ENC_GET_HDR_SYNC failed: ret={ret}"
                     )
-                pos = _lib.mpp_packet_get_pos(tmp_pkt)
-                length = _lib.mpp_packet_get_length(tmp_pkt)
-                if pos and length:
-                    self._extradata = ctypes.string_at(pos, length)
+                else:
+                    pos = _lib.mpp_packet_get_pos(tmp_pkt)
+                    length = _lib.mpp_packet_get_length(tmp_pkt)
+                    if pos and length:
+                        self._extradata = ctypes.string_at(pos, length)
             finally:
                 _lib.mpp_packet_deinit(byref(tmp_pkt))
 
@@ -1543,6 +1709,19 @@ class MppEncoder:
         return self._rc_mode_name
 
     @property
+    def q_factor(self) -> int:
+        """JPEG quality factor (1..99) used by the MJPEG encoder.
+
+        Higher == better quality, larger file. Ignored when ``coding_type``
+        is H.264 / HEVC — those derive quantisation from ``rc_mode``.
+        """
+        return self._q_factor
+
+    @property
+    def coding_type(self) -> int:
+        return self._coding
+
+    @property
     def extradata(self) -> bytes:
         """SPS / PPS / VPS blob in Annex B format (``00 00 00 01`` start codes).
 
@@ -1569,6 +1748,13 @@ class MppEncoder:
             return
         self._closed = True
         with _mpp_lock:
+            if self._packet_bound and self._packet:
+                # The MJPEG path keeps one packet handle bound to
+                # ``self._pkt_buf`` across ``encode`` calls — release
+                # it before the buffer itself goes away.
+                _lib.mpp_packet_deinit(byref(self._packet))
+                self._packet = MppPacket()
+                self._packet_bound = False
             if self._frm_buf:
                 _lib.mpp_buffer_put_with_caller(self._frm_buf, b"rkv-mpp")
                 self._frm_buf = MppBuffer()
@@ -1584,14 +1770,19 @@ class MppEncoder:
 
     # -- encode entry point -------------------------------------------------
 
-    def encode(self, frame_bgr: "np.ndarray") -> EncodedPacket:
-        """Submit one BGR ndarray to the encoder and block until the
+    def encode(self, frame: "np.ndarray") -> EncodedPacket:
+        """Submit one ndarray to the encoder and block until the
         matching encoded packet is available.
 
-        *frame_bgr* must be ``(H, W, 3)`` ``uint8`` with the same width
-        / height passed to the constructor. Shape and dtype are
-        validated; an asynchronous MPP error (typically BUFFER_FULL
-        on the input queue) raises ``RuntimeError``.
+        The expected shape depends on ``input_format``:
+
+        * NV12 / NV21 / I420 — ``(H * 3 // 2, W)`` ``uint8`` (Y plane
+          + UV plane, either interleaved or stacked).
+        * RGB / BGR — ``(H, W, 3)`` ``uint8``.
+        * RGBA / BGRA — ``(H, W, 4)`` ``uint8``.
+
+        The dtype / layout is validated; an asynchronous MPP error
+        (typically BUFFER_FULL on the input queue) raises ``RuntimeError``.
 
         The encoder is single-threaded and synchronous: one ``encode``
         call in, one :class:`EncodedPacket` out. If you want to keep
@@ -1604,19 +1795,32 @@ class MppEncoder:
             raise RuntimeError("MppEncoder is closed")
         if self._flushed:
             raise RuntimeError("MppEncoder is already flushed")
+
+        _, channels, layout = self._FORMAT_LAYOUT[self._input_format]
+        if layout == "YUV":
+            expected_shape = (
+                int(self._height * self._YUV_HEIGHT_MULTIPLIER[self._input_format]),
+                self._width,
+            )
+            expected_dtype = (
+                np.uint16 if self._input_format == MppFrameFormat.YUV420SP_10BIT
+                else np.uint8
+            )
+        else:
+            expected_shape = (self._height, self._width, channels)
+            expected_dtype = np.uint8
         if (
-            frame_bgr.ndim != 3
-            or frame_bgr.shape[0] != self._height
-            or frame_bgr.shape[1] != self._width
-            or frame_bgr.shape[2] != 3
-            or frame_bgr.dtype != np.uint8
+            frame.ndim != len(expected_shape)
+            or frame.shape[0] != expected_shape[0]
+            or frame.shape[1] != expected_shape[1]
+            or frame.dtype != expected_dtype
         ):
             raise ValueError(
-                f"frame must be ({self._height}, {self._width}, 3) uint8, "
-                f"got shape={frame_bgr.shape} dtype={frame_bgr.dtype}"
+                f"frame must be {expected_shape} {np.dtype(expected_dtype).name}, input_format "
+                f"{self._input_format}, got shape={frame.shape} dtype={frame.dtype.name}"
             )
-        if not frame_bgr.flags.c_contiguous:
-            frame_bgr = np.ascontiguousarray(frame_bgr)
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
 
         with _mpp_lock:
             # Optionally request an IDR for this frame.
@@ -1636,7 +1840,7 @@ class MppEncoder:
             )
             if not buf_ptr:
                 raise RuntimeError("MppEncoder: failed to get buffer pointer")
-            ctypes.memmove(buf_ptr, frame_bgr.ctypes.data, self._frame_buf_size)
+            ctypes.memmove(buf_ptr, frame.ctypes.data, self._frame_buf_size)
             # CPU wrote to the buffer — flush so DMA can read it
             # coherently. NORMAL buffers are CPU-malloc-backed, so this
             # is a plain cache flush (no DMA cache to worry about).
@@ -1645,6 +1849,106 @@ class MppEncoder:
             except RuntimeError:
                 pass  # some lib versions emit "not implemented" here
 
+            if self._coding == MppCodingType.MJPEG:
+                # MJPEG needs the output packet pre-attached to the
+                # frame via MppMeta (KEY_OUTPUT_PACKET) — without it
+                # the JPEG HAL falls back to asking the buffer group
+                # for a packet, which reports size 0 on this firmware
+                # and trips ``mpp_enc_check_pkt_buf``. The H.264 path
+                # doesn't need this; the direct ``encode_get_packet``
+                # API works for it.
+                data, pts_out, is_keyframe = self._encode_put_get_mjpeg()
+            else:
+                data, pts_out, is_keyframe = self._encode_put_get_h264()
+
+            self._pts += 1
+
+        return EncodedPacket(data=data, pts=pts_out, is_keyframe=is_keyframe)
+
+    def _encode_put_get_h264(self):
+        """H.264 encode path: put frame, get packet directly.
+
+        Returns ``(data, pts, is_keyframe)`` so the caller can wrap
+        them in an :class:`EncodedPacket` once outside the lock.
+        """
+        _lib.mpp_frame_init(byref(self._frame))
+        try:
+            _lib.mpp_frame_set_width(self._frame, self._width)
+            _lib.mpp_frame_set_height(self._frame, self._height)
+            _lib.mpp_frame_set_hor_stride(self._frame, self._hor_stride)
+            _lib.mpp_frame_set_ver_stride(self._frame, self._ver_stride)
+            _lib.mpp_frame_set_fmt(self._frame, int(self._input_format))
+            _lib.mpp_frame_set_pts(self._frame, self._pts)
+            _lib.mpp_frame_set_buffer(self._frame, self._frm_buf)
+            ret = self._api.contents.encode_put_frame(self._ctx, self._frame)
+            if ret != 0:
+                raise RuntimeError(f"encode_put_frame failed: ret={ret}")
+        finally:
+            _lib.mpp_frame_deinit(byref(self._frame))
+            self._frame = MppFrame()
+
+        _check(
+            _lib.mpp_packet_init_with_buffer(byref(self._packet), self._pkt_buf),
+            "mpp_packet_init_with_buffer (output)",
+        )
+        self._packet_bound = True
+        try:
+            _lib.mpp_packet_set_length(self._packet, 0)
+            ret = self._api.contents.encode_get_packet(
+                self._ctx, byref(self._packet)
+            )
+            if ret != 0:
+                raise RuntimeError(f"encode_get_packet failed: ret={ret}")
+            pos = _lib.mpp_packet_get_pos(self._packet)
+            length = _lib.mpp_packet_get_length(self._packet)
+            flag = _lib.mpp_packet_get_flag(self._packet)
+            data = ctypes.string_at(pos, length) if length else b""
+            is_keyframe = bool(flag & MPP_PACKET_FLAG_INTRA)
+            pts_out = _lib.mpp_packet_get_pts(self._packet)
+        finally:
+            _lib.mpp_packet_deinit(byref(self._packet))
+            self._packet = MppPacket()
+            self._packet_bound = False
+        return data, pts_out, is_keyframe
+
+    def _encode_put_get_mjpeg(self):
+        """MJPEG encode path: pre-attach output packet via MppMeta.
+
+        The JPEG HAL refuses to fall back to asking the buffer group
+        for an output packet (it asserts in
+        ``mpp_enc_check_pkt_buf``), so the caller has to provide one
+        upfront — see :func:`encode` for the rationale.
+
+        The packet is bound to ``self._pkt_buf`` once (the first time
+        this method runs) and then reused across calls; binding it
+        every call would thrash MPP's internal refcounts and emit
+        ``put_meta invalid negative ref_count -1`` warnings. Returns
+        the same ``(data, pts, is_keyframe)`` tuple as the H.264
+        helper.
+        """
+        if not self._packet_bound:
+            _check(
+                _lib.mpp_packet_init_with_buffer(
+                    byref(self._packet), self._pkt_buf
+                ),
+                "mpp_packet_init_with_buffer (mjpeg output)",
+            )
+            self._packet_bound = True
+
+        meta = MppMeta()
+        ret = _lib.mpp_meta_get_with_tag(
+            byref(meta), b"rkv-mpp", b"rkv-encoder-mjpeg"
+        )
+        if ret != 0 or not meta:
+            raise RuntimeError(f"mpp_meta_get failed: ret={ret}")
+        try:
+            _lib.mpp_packet_set_length(self._packet, 0)
+            _check(
+                _lib.mpp_meta_set_packet(
+                    meta, KEY_OUTPUT_PACKET, self._packet
+                ),
+                "mpp_meta_set_packet (KEY_OUTPUT_PACKET)",
+            )
             _lib.mpp_frame_init(byref(self._frame))
             try:
                 _lib.mpp_frame_set_width(self._frame, self._width)
@@ -1654,43 +1958,34 @@ class MppEncoder:
                 _lib.mpp_frame_set_fmt(self._frame, int(self._input_format))
                 _lib.mpp_frame_set_pts(self._frame, self._pts)
                 _lib.mpp_frame_set_buffer(self._frame, self._frm_buf)
-                ret = self._api.contents.encode_put_frame(self._ctx, self._frame)
+                _lib.mpp_frame_set_meta(self._frame, meta)
+                ret = self._api.contents.encode_put_frame(
+                    self._ctx, self._frame
+                )
                 if ret != 0:
-                    raise RuntimeError(f"encode_put_frame failed: ret={ret}")
+                    raise RuntimeError(
+                        f"encode_put_frame (mjpeg) failed: ret={ret}"
+                    )
             finally:
                 _lib.mpp_frame_deinit(byref(self._frame))
                 self._frame = MppFrame()
 
-            self._pts += 1
+            # The same packet handle's ``pos``/``length`` fields get
+            # updated by the encoder — that's what upstream
+            # ``mpi_enc_test.c`` does too. ``mpp_meta_put`` releases
+            # its borrow on the packet; the underlying buffer
+            # (``self._pkt_buf``) and the packet itself stay alive
+            # until :meth:`close` deinits them.
+            pos = _lib.mpp_packet_get_pos(self._packet)
+            length = _lib.mpp_packet_get_length(self._packet)
+            flag = _lib.mpp_packet_get_flag(self._packet)
+            data = ctypes.string_at(pos, length) if length else b""
+            is_keyframe = bool(flag & MPP_PACKET_FLAG_INTRA)
+            pts_out = _lib.mpp_packet_get_pts(self._packet)
+        finally:
+            _lib.mpp_meta_put(meta)
 
-            # Drain the output packet. ``encode_get_packet`` blocks
-            # internally until a packet is available (or errors), so
-            # one call is enough — no polling loop needed. As with
-            # HDR_SYNC, the packet must be backed by an explicit
-            # MppBuffer; reusing ``self._pkt_buf`` here keeps the
-            # call hot-path allocation-free.
-            _check(
-                _lib.mpp_packet_init_with_buffer(byref(self._packet), self._pkt_buf),
-                "mpp_packet_init_with_buffer (output)",
-            )
-            try:
-                _lib.mpp_packet_set_length(self._packet, 0)
-                ret = self._api.contents.encode_get_packet(
-                    self._ctx, byref(self._packet)
-                )
-                if ret != 0:
-                    raise RuntimeError(f"encode_get_packet failed: ret={ret}")
-                pos = _lib.mpp_packet_get_pos(self._packet)
-                length = _lib.mpp_packet_get_length(self._packet)
-                flag = _lib.mpp_packet_get_flag(self._packet)
-                data = ctypes.string_at(pos, length) if length else b""
-                is_keyframe = bool(flag & MPP_PACKET_FLAG_INTRA)
-                pts_out = _lib.mpp_packet_get_pts(self._packet)
-            finally:
-                _lib.mpp_packet_deinit(byref(self._packet))
-                self._packet = MppPacket()
-
-        return EncodedPacket(data=data, pts=pts_out, is_keyframe=is_keyframe)
+        return data, pts_out, is_keyframe
 
     def encode_external_fd(
         self,
