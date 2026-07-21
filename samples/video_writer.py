@@ -9,7 +9,10 @@ encoder. Codec choices:
   encoder, works on any machine.
 * ``h264`` — MPP hardware only (requires Rockchip SoC); raises
   ``RuntimeError`` on platforms where MPP isn't available.
-* ``mjpeg`` — PyAV's built-in MJPEG software encoder.
+* ``mjpeg`` — MPP hardware JPEG only (requires Rockchip SoC);
+  raises ``RuntimeError`` on platforms where MPP isn't available.
+  See ``samples/mpp_mjpeg_writer.py`` for the dedicated MJPEG
+  smoke sample.
 
 Run::
 
