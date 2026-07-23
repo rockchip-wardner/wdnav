@@ -152,6 +152,7 @@ class VideoWriter:
         gop: int = ...,
         bframes: int = ...,
         rc_mode: str = ...,
+        q_factor: int = ...,
     ) -> None: ...
     def write(self, frame: np.ndarray | "DecodedFrame") -> None: ...
     backend: str  # "mpp" | "pyav" | "ws-jpeg"

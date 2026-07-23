@@ -27,8 +27,22 @@ classifiers = [
 ]
 # 第三方 Python 依赖。VideoCapture / VideoWriter 路径（av/numpy/v4l2）
 # 只会在显式 import rkv.video / rkv.encoder 时触发；纯 import rkv 不会强制装这些。
+#
+# PyAV: rkv.encoder.VideoWriter 强依赖
+#   * ``Container.add_mux_stream(codec_name, **kwargs)`` — "pre-encoded
+#     packet" 入口；
+#   * matroska muxer 自动跑的 ``extract_extradata`` BSF（从首 packet NAL 流
+#     抽 SPS/PPS 写到 codecpar.extradata）。
+# 这两个功能由 PyAV PR #2305 引入（commit 5b48f2d，2026-06-14 merge 到 main）。
+# PyPI 上最新 wheel 是 18.0.0，**不包含此修复**，安装后 VideoWriter 会写
+# 默认 1280×720 High avcC，decoder 拒绝解码。
+# 在 PyAV 发布 ≥19 wheel 之前，请按 README “Building from source” 一节
+# 装主分支的 PyAV：
+#   pip install av @ https://github.com/PyAV-Org/PyAV/archive/main.tar.gz
+# 其他系统（v4l2 / numpy）行为不变。
 dependencies = [
-    "av>=10.0",
+    "av>=11.0.dev0; sys_platform == 'linux'",
+    "av>=10.0; sys_platform != 'linux'",
     "numpy>=1.20",
     "v4l2>=0.2",
 ]
