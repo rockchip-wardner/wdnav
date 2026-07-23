@@ -124,10 +124,18 @@ class MppCodingType:
     MJPEG = 8
     VP8 = 9
     VP9 = 10
-    HEVC = 13        # H.265
-    AVS = 18
-    AVS2 = 19
-    AV1 = 20
+    # ``MPP_VIDEO_CodingVC1 = 0x01000000`` is an explicit assignment in the
+    # upstream C enum (``usr/include/rockchip/rk_type.h``), so the entries
+    # that follow auto-increment from 0x01000000, not from 11. The numeric
+    # value is what ``mpi_dec_test`` reports on this SoC (``h.265/HEVC
+    # id 16777220``). Using the wrong value routes the request to a non-
+    # existent coding slot and ``mpp_check_soc_cap`` returns 0 with
+    # ``unable to create dec … for soc rk3588 unsupported``.
+    HEVC = 0x01000004        # H.265
+    AVSPLUS = 0x01000005
+    AVS = 0x01000006
+    AVS2 = 0x01000007
+    AV1 = 0x01000008
 
 
 class MppFrameFormat:
@@ -2301,6 +2309,63 @@ def parse_avcc_extradata(extradata: bytes) -> bytes:
     return bytes(out)
 
 
+# hvcC / HEVCDecoderConfigurationRecord has more variable-length header fields
+# than avcC, so the parser below is laid out a bit differently. The relevant
+# NAL unit types are VPS (32), SPS (33) and PPS (34); only those are emitted,
+# in that order, each prefixed with the 4-byte start code MPP's input parser
+# recognises (``split_parse=0`` looks for ``00 00 00 01`` / ``00 00 01``).
+_HVC_NAL_VPS = 32
+_HVC_NAL_SPS = 33
+_HVC_NAL_PPS = 34
+
+
+def parse_hvcc_extradata(extradata: bytes) -> bytes:
+    """Return VPS+SPS+PPS as an Annex B byte stream from an hvcC configuration.
+
+    Same purpose as :func:`parse_avcc_extradata`, but for HEVC. The 22-byte
+    fixed header is followed by ``numOfArrays`` NAL arrays (each array is
+    one NAL type — VPS/SPS/PPS/prefix-SEI/etc.). We only emit VPS/SPS/PPS,
+    which is what MPP's H.265 decoder needs to bootstrap.
+    """
+    if not extradata or len(extradata) < 23 or extradata[0] != 1:
+        return b""
+    # 22 bytes of fixed fields, then numOfArrays.
+    i = 22
+    num_arrays = extradata[i]
+    i += 1
+    out = bytearray()
+    for _ in range(num_arrays):
+        if i + 3 > len(extradata):
+            break
+        # array_completeness(1) | reserved(1) | NAL_unit_type(6)
+        # The array metadata byte stores nal_unit_type in bits 0-5 (the top
+        # two bits are array_completeness and reserved), unlike a real HEVC
+        # NAL byte where the type lives in bits 1-6.
+        nal_type = extradata[i] & 0x3F
+        i += 1
+        num_nalus = int.from_bytes(extradata[i : i + 2], "big")
+        i += 2
+        if nal_type not in (_HVC_NAL_VPS, _HVC_NAL_SPS, _HVC_NAL_PPS):
+            # Skip non-VPS/SPS/PPS arrays (e.g. prefix SEI) wholesale.
+            for _inner in range(num_nalus):
+                if i + 2 > len(extradata):
+                    break
+                nal_len = int.from_bytes(extradata[i : i + 2], "big")
+                i += 2 + nal_len
+            continue
+        for _ in range(num_nalus):
+            if i + 2 > len(extradata):
+                break
+            nal_len = int.from_bytes(extradata[i : i + 2], "big")
+            i += 2
+            if i + nal_len > len(extradata):
+                break
+            out.extend(b"\x00\x00\x00\x01")
+            out.extend(extradata[i : i + nal_len])
+            i += nal_len
+    return bytes(out)
+
+
 __all__ = [
     "MppApi",
     "MppBufferInfo",
@@ -2319,6 +2384,7 @@ __all__ = [
     "EncodedPacket",
     "avcc_to_annexb",
     "parse_avcc_extradata",
+    "parse_hvcc_extradata",
     "nv12_to_bgr",
     "mpp_buffer_sync_cpu_read",
     "mpp_buffer_sync_cpu_write",

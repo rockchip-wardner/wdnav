@@ -33,6 +33,7 @@ decoder is torn down on exit.
 from __future__ import annotations
 
 import ctypes
+import re
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -58,6 +59,7 @@ from .mpp import (
     _resolve_output_format,
     avcc_to_annexb,
     parse_avcc_extradata,
+    parse_hvcc_extradata,
 )
 
 
@@ -103,6 +105,136 @@ def _demuxer_options_for(path_str: str) -> dict:
         # frames silently. TCP is the only safe choice for live ingest.
         return {"rtsp_transport": "tcp"}
     return {}
+
+
+# FFmpeg's ``av_dump_format`` produces one line per stream; for the first video
+# stream it reads ``streams[i]->codecpar->codec_id`` and looks the codec name up
+# via ``avcodec_descriptor_get`` — neither of which requires the actual decoder
+# to be registered with libavcodec. We use that string as a fallback when
+# ``stream.codec_context`` is ``None`` (PyAV only populates a CodecContext after
+# ``avcodec_find_decoder`` succeeds, which fails for codecs missing from the
+# slim build of FFmpeg that the rkv samples bundle — see AGENTS.md).
+_VIDEO_STREAM_RE = re.compile(
+    r"\bVideo:\s+(?P<codec>[A-Za-z0-9_]+)[^\n]*?"
+    r"(?P<width>\d{2,5})x(?P<height>\d{2,5}),"
+)
+
+
+def _video_stream_info_from_dump(container) -> Tuple[Optional[str], int, int]:
+    """Recover codec name + width/height from ``av_dump_format`` output.
+
+    Only used as a fallback when ``stream.codec_context`` is ``None``.
+    Returns ``(None, 0, 0)`` if the dump is empty or contains no ``Video:``
+    line, so the caller can surface a clear error.
+    """
+    prev_level = av.logging.get_level()
+    try:
+        # ``av_dump_format`` writes via the FFmpeg log callback, which PyAV
+        # captures only when the log level is verbose enough.
+        av.logging.set_level(av.logging.VERBOSE)
+        dump = container.dumps_format()
+    finally:
+        av.logging.set_level(prev_level)
+    m = _VIDEO_STREAM_RE.search(dump)
+    if not m:
+        return None, 0, 0
+    return m.group("codec"), int(m.group("width")), int(m.group("height"))
+
+
+def _read_codec_config_box(path_str: str, kinds: Tuple[str, ...]) -> bytes:
+    """Pull the H.264 ``avcC`` / H.265 ``hvcC`` configuration record straight
+    out of the MP4 (or HEIF/MOV) container.
+
+    PyAV exposes the same data through ``stream.codec_context.extradata``, but
+    only when the corresponding FFmpeg decoder has been registered; the slim
+    build shipped with the rkv samples deliberately omits decoders beyond H.264
+    (see AGENTS.md). Walking the ISO BMFF box tree ourselves keeps the path
+    demuxer-only and free of any avcodec dependency.
+
+    ``kinds`` is the list of box four-character codes to look for inside the
+    first video track's ``stsd`` sample-entry (``avcC``, ``hvcC``). Returns
+    ``b""`` when nothing is found — callers treat that as "no SPS/PPS to
+    inject", which is fine for streaming protocols that carry them in-band.
+    """
+    with open(path_str, "rb") as f:
+        data = f.read()
+    # Container format boxes that can carry ``moov``. We scan all top-level
+    # boxes because ``mdat`` can sit before or after ``moov`` (and ``moof``
+    # appears in fragmented MP4, which we don't bother handling — those files
+    # already supply SPS/PPS per fragment).
+    moov_offsets: list[int] = []
+    i = 0
+    n = len(data)
+    while i + 8 <= n:
+        size = int.from_bytes(data[i : i + 4], "big")
+        tag = data[i + 4 : i + 8]
+        if size < 8 or i + size > n:
+            break
+        if tag == b"moov":
+            moov_offsets.append(i + 8)
+        elif tag == b"moof":
+            # Fragmented MP4 — bail out; SPS/PPS travel with each ``mdat``.
+            return b""
+        i += size
+
+    # Iterate every moov we found; in practice there's one, but we don't want
+    # a malformed file to silently return empty.
+    for moov_start in moov_offsets:
+        config_box = _walk_for_codec_config(data, moov_start, kinds)
+        if config_box:
+            return config_box
+    return b""
+
+
+def _walk_for_codec_config(
+    data: bytes, start: int, kinds: Tuple[str, ...]
+) -> bytes:
+    """Depth-limited iso-bmff walker looking for the first video track's
+    sample-entry and the requested configuration box inside it.
+
+    The walker doesn't try to be a generic ISO BMFF parser — it knows the
+    handful of box types required to reach ``avcC``/``hvcC`` from ``moov`` and
+    treats any non-box-shaped area (non-container box or stray fixed fields
+    of an AVC/HEVC sample entry) as bytes it can step past. ``stsd`` skips
+    its 8-byte version+flags+entry-count prelude; VisualSampleEntry sample
+    entries (``avc1``/``hvc1``) skip their 78-byte fixed fields before we
+    look for child boxes.
+    """
+    kinds_b = tuple(k.encode("ascii") for k in kinds)
+    container_boxes = (
+        b"trak", b"mdia", b"minf", b"stbl", b"stsd",
+        b"hvc1", b"hev1", b"avc1", b"avc3", b"av01",
+    )
+    _VSE_FIXED_LEN = 78
+    _STSD_HEADER_LEN = 8  # 1B version + 3B flags + 4B entry_count
+
+    def _walk(offset: int, end: int, depth: int) -> bytes:
+        i = offset
+        while i + 8 <= end:
+            sz = int.from_bytes(data[i : i + 4], "big")
+            tag = data[i + 4 : i + 8]
+            if sz < 8 or i + sz > end or sz > end - i + 8:
+                # Stray bytes that aren't a valid box (e.g. inside
+                # VisualSampleEntry compressed-name padding): advance and
+                # keep scanning rather than giving up on this whole branch.
+                i += 4
+                continue
+            inner_end = i + sz
+            if tag in kinds_b:
+                return data[i + 8 : inner_end]
+            if tag in container_boxes and depth < 16:
+                child_start = i + 8
+                if tag == b"stsd":
+                    child_start = i + 8 + _STSD_HEADER_LEN
+                elif tag in (b"hvc1", b"hev1", b"avc1", b"avc3", b"av01"):
+                    child_start = i + 8 + _VSE_FIXED_LEN
+                child = _walk(child_start, inner_end, depth + 1)
+                if child:
+                    return child
+            i = inner_end
+        return b""
+
+    return _walk(start, len(data), 0)
 
 
 class VideoCapture:
@@ -203,7 +335,18 @@ class VideoCapture:
             self._container.close()
             raise RuntimeError(f"{path_str}: no video stream found")
         self._stream = self._container.streams.video[0]
-        codec_name = self._stream.codec_context.name
+        ctx = self._stream.codec_context
+        if ctx is not None:
+            codec_name = ctx.name
+            width, height = ctx.width or 0, ctx.height or 0
+        else:
+            # Slim FFmpeg build (e.g. ``--enable-decoder=h264`` only) leaves
+            # ``codec_context`` unset for codecs whose decoder isn't registered.
+            # Demuxing still works — we recover the codec name (and width /
+            # height) from the FFmpeg ``av_dump_format`` output, which reads
+            # ``codecpar->codec_id`` and the descriptor table, neither of
+            # which require the decoder to exist.
+            codec_name, width, height = _video_stream_info_from_dump(self._container)
         coding = CODING_BY_NAME.get(codec_name)
         if coding is None:
             self._container.close()
@@ -213,8 +356,8 @@ class VideoCapture:
             )
 
         # Properties surfaced to the caller (OpenCV-compatible names).
-        self.width: int = self._stream.codec_context.width or 0
-        self.height: int = self._stream.codec_context.height or 0
+        self.width: int = width
+        self.height: int = height
         self.fps: float = float(self._stream.average_rate or 0)
         self.frame_pos: int = 0   # frames handed back to the caller so far
 
@@ -236,11 +379,21 @@ class VideoCapture:
         self._decoder = MppDecoder(coding_type=coding, split_parse=False)
         # H.264/HEVC: prepend SPS/PPS from the avcC/hvcC configuration
         # box to the first sample so the decoder knows how to parse it.
-        self._sps_pps = (
-            parse_avcc_extradata(self._stream.codec_context.extradata or b"")
-            if codec_name in ("h264", "hevc", "h265")
-            else b""
-        )
+        # ``CODING_BY_NAME`` always hands back a normalised ffmpeg name
+        # (``h264`` / ``hevc``); the extra aliases are kept for callers
+        # that set ``codec_name`` directly on a custom-built container.
+        if codec_name in ("h264", "avc1"):
+            config_box = _read_codec_config_box(
+                path_str, ("avcC",)
+            )
+            self._sps_pps = parse_avcc_extradata(config_box)
+        elif codec_name in ("hevc", "h265", "hvc1", "hev1"):
+            config_box = _read_codec_config_box(
+                path_str, ("hvcC",)
+            )
+            self._sps_pps = parse_hvcc_extradata(config_box)
+        else:
+            self._sps_pps = b""
         self._sent_extradata = not self._sps_pps
         self._codec_name = codec_name
         self._is_v4l2: bool = False
