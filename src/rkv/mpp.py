@@ -587,28 +587,40 @@ _lib.mpp_enc_cfg_deinit.argtypes = [c_void_p]
 _lib.mpp_enc_cfg_deinit.restype = MPP_RET
 
 for _enc_fn in ("set_u8", "set_u16", "set_u32", "set_u64"):
-    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}", None)
+    if _f is None:
+        continue
     _f.argtypes = [c_void_p, c_char_p, c_uint32]
     _f.restype = MPP_RET
 for _enc_fn in ("set_s8", "set_s16", "set_s32", "set_s64"):
-    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}", None)
+    if _f is None:
+        continue
     _f.argtypes = [c_void_p, c_char_p, c_int32]
     _f.restype = MPP_RET
 for _enc_fn in ("set_st", "set_ptr"):
-    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}", None)
+    if _f is None:
+        continue
     _f.argtypes = [c_void_p, c_char_p, c_void_p]
     _f.restype = MPP_RET
 
 for _enc_fn in ("get_u8", "get_u16", "get_u32", "get_u64"):
-    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}", None)
+    if _f is None:
+        continue
     _f.argtypes = [c_void_p, c_char_p, POINTER(c_uint32)]
     _f.restype = MPP_RET
 for _enc_fn in ("get_s8", "get_s16", "get_s32", "get_s64"):
-    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}", None)
+    if _f is None:
+        continue
     _f.argtypes = [c_void_p, c_char_p, POINTER(c_int32)]
     _f.restype = MPP_RET
 for _enc_fn in ("get_st", "get_ptr"):
-    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}")
+    _f = getattr(_lib, f"mpp_enc_cfg_{_enc_fn}", None)
+    if _f is None:
+        continue
     _f.argtypes = [c_void_p, c_char_p, c_void_p]
     _f.restype = MPP_RET
 
