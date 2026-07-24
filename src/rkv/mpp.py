@@ -584,6 +584,17 @@ class MppEncoder:
         MppFrameFormat.RGBA: (4.0, 4, "HWC"),
         MppFrameFormat.BGRA: (4.0, 4, "HWC"),
     }
+    # Packed pixel formats (BGR/RGB-family, 3 or 4 channels) that
+    # :meth:`encode` converts to NV12 before handing the buffer to
+    # the shim. The shim/encoder sees NV12 either way, so its input
+    # buffer (``w*h*3`` for BGR/RGB-mode init) is just oversized —
+    # 1.5 bytes/pixel NV12 still fits inside.
+    _PACKED_PIXEL_FORMATS = {
+        MppFrameFormat.RGB888,
+        MppFrameFormat.BGR888,
+        MppFrameFormat.RGBA,
+        MppFrameFormat.BGRA,
+    }
     _YUV_HEIGHT_MULTIPLIER = {
         MppFrameFormat.YUV420SP: 1.5,
         MppFrameFormat.YUV420SP_10BIT: 1.5,
@@ -651,6 +662,23 @@ class MppEncoder:
         self._input_format = input_format
         self._q_factor = int(q_factor)
 
+        # The shim / MPP HAL is configured at init time via
+        # ``prep:format``. If we leave it at BGR888 but feed NV12
+        # frames from :meth:`encode`, the HAL applies its own
+        # BGR→YUV conversion on top — and on this SoC that path
+        # treats packed BGR bytes as if they were planar Y/UV,
+        # producing the classic "left/centre/right stripes"
+        # garbage. So whenever the caller hands in a packed-pixel
+        # format (BGR / RGB / RGBA / BGRA), we route through the
+        # RGA conversion in :meth:`encode` and tell the shim the
+        # format is NV12 end-to-end. For everything else (NV12,
+        # NV21, I420, …) we pass the caller's format straight
+        # through.
+        if input_format in self._PACKED_PIXEL_FORMATS:
+            self._shim_input_format = int(MppFrameFormat.YUV420SP)
+        else:
+            self._shim_input_format = int(input_format)
+
         self._handle: Optional[c_void_p] = None
         self._extradata: bytes = b""
         self._closed = False
@@ -663,7 +691,7 @@ class MppEncoder:
                 int(coding_type), int(width), int(height), int(fps),
                 int(bitrate), int(gop),
                 int(profile_idc), int(rc_mode_id),
-                int(input_format), int(q_factor),
+                self._shim_input_format, int(q_factor),
                 err_buf, 512,
                 byref(handle),
             )
@@ -762,15 +790,33 @@ class MppEncoder:
         if not frame.flags.c_contiguous:
             frame = np.ascontiguousarray(frame)
 
+        # When the caller passed a packed-pixel format (BGR / RGB /
+        # RGBA / BGRA), we go through RGA → NV12 (or the numpy
+        # fallback) and feed the shim NV12 directly. The shim was
+        # already configured with ``prep:format = NV12`` at init
+        # time (see :meth:`__init__`), so the per-frame format arg
+        # here is redundant — but passing it keeps the on-frame
+        # ``mpp_frame_set_fmt`` in sync with the buffer layout
+        # even if a future refactor moves init-time prep config.
+        if self._input_format in self._PACKED_PIXEL_FORMATS:
+            shim_input = _bgr_to_nv12_np(frame, self._input_format)
+            shim_size = shim_input.nbytes
+            shim_buf = shim_input.ctypes.data
+        else:
+            shim_input = frame
+            shim_size = frame.nbytes
+            shim_buf = frame.ctypes.data
+        shim_format = self._shim_input_format
+
         err_buf = ctypes.create_string_buffer(512)
         with _mpp_lock:
             ret = _lib.rkv_enc_put_frame(
                 self._handle,
-                ctypes.cast(frame.ctypes.data, c_void_p),
-                frame.nbytes,
+                ctypes.cast(shim_buf, c_void_p),
+                shim_size,
                 self._width, self._height,
                 self._width, self._height,
-                int(self._input_format), 0,
+                shim_format, 0,
                 err_buf, 512,
             )
         if ret != 0:
@@ -1166,6 +1212,112 @@ def _nv12_to_bgr_np(nv12):
     g = np.clip(y - 0.34414 * u_up - 0.71414 * v_up, 0, 255).astype(np.uint8)
     r = np.clip(y + 1.402 * v_up, 0, 255).astype(np.uint8)
     return np.stack([b, g, r], axis=-1)
+
+
+def _bgr_to_nv12_np(bgr, src_format: int):
+    """Convert a packed-pixel ndarray (BGR/RGB/RGBA/BGRA) to NV12 via RGA.
+
+    Used by :meth:`MppEncoder.encode` when the caller's
+    ``input_format`` is BGR/RGB-family: the firmware's on-chip
+    BGR→YUV path was producing garbage on this SoC (decoded output
+    showed the three channel planes split into left/centre/right
+    strips instead of merged chroma), so we route the conversion
+    through RGA2 and feed the encoder NV12 directly. The encoder's
+    input buffer is sized for BGR (``w*h*3``) and so always has
+    room for the NV12 payload (``w*h*3/2``).
+
+    ``src_format`` is the ``MppFrameFormat`` the caller is feeding in
+    (BGR888 / RGB888 / BGRA / RGBA) — drives the RGA source format
+    code so the channel order matches the caller's memory layout.
+
+    Both ``height`` and ``width`` must be even — NV12 chroma is
+    4:2:0 subsampled. :meth:`MppEncoder.encode` rejects odd
+    dimensions upstream so the firmware doesn't see a mismatch
+    between the reported frame geometry and the NV12 payload.
+
+    Falls back to a numpy BT.601 conversion if RGA fails (driver
+    missing, formats RGA doesn't support, etc.) so the encoder
+    still works on dev boxes without librga.
+    """
+    import ctypes
+
+    import numpy as np
+
+    from . import rga
+
+    h, w = bgr.shape[0], bgr.shape[1]
+    if h % 2 or w % 2:
+        raise ValueError(
+            f"BGR→NV12 conversion requires even width/height, got {w}x{h}"
+        )
+
+    rga_src_fmt = {
+        MppFrameFormat.BGR888: rga.RgaFormat.BGR_888,
+        MppFrameFormat.RGB888: rga.RgaFormat.RGB_888,
+        MppFrameFormat.BGRA:   rga.RgaFormat.BGRA_8888,
+        MppFrameFormat.RGBA:   rga.RgaFormat.RGBA_8888,
+    }[src_format]
+    if bgr.ndim != 3 or bgr.shape[2] not in (3, 4):
+        raise ValueError(
+            f"expected 3- or 4-channel packed-pixel ndarray, got shape {bgr.shape}"
+        )
+
+    # RGA wants a contig, aligned buffer. Allocate via ``ctypes`` so we
+    # can pass its virtual address to ``wrap_virtual`` without copying.
+    nv12_size = h * w * 3 // 2
+    dst_storage = (ctypes.c_uint8 * nv12_size)()
+
+    try:
+        src_buf = rga.wrap_virtual(bgr.ctypes.data, w, h, rga_src_fmt)
+        dst_buf = rga.wrap_virtual(
+            ctypes.addressof(dst_storage), w, h, rga.RgaFormat.YCbCr_420_SP
+        )
+        rga.cvtcolor(src_buf, dst_buf, sync=True)
+        rga.flush()
+    except Exception:
+        # librga missing / format unsupported — fall back to numpy.
+        return _bgr_to_nv12_np_fallback(bgr)
+
+    return np.frombuffer(dst_storage, dtype=np.uint8).reshape(h * 3 // 2, w)
+
+
+def _bgr_to_nv12_np_fallback(bgr):
+    """Pure-numpy BT.601 limited-range BGR→NV12. Used only when RGA fails.
+
+    Kept as a separate function so the RGA fast path isn't burdened
+    with the fallback's computation overhead on every frame, and so
+    future RGA fixes can be benchmarked against the baseline.
+    """
+    import numpy as np
+
+    h, w = bgr.shape[0], bgr.shape[1]
+    if bgr.shape[2] == 4:
+        bgr = bgr[:, :, :3]
+    b = bgr[..., 0].astype(np.int16)
+    g = bgr[..., 1].astype(np.int16)
+    r = bgr[..., 2].astype(np.int16)
+
+    # BT.601 limited range, integer fixed-point to match the firmware's
+    # coefficients and avoid float rounding noise. Coefficients are
+    # multiplied by 256 then right-shifted; +128 rounds to nearest.
+    y = (( 66 * r + 129 * g +  25 * b + 128) >> 8) + 16
+    u = ((-38 * r -  74 * g + 112 * b + 128) >> 8) + 128
+    v = ((112 * r -  94 * g -  18 * b + 128) >> 8) + 128
+
+    y = np.clip(y, 16, 235).astype(np.uint8)
+    u = np.clip(u, 16, 240).astype(np.uint8)
+    v = np.clip(v, 16, 240).astype(np.uint8)
+
+    u_sub = u[::2, ::2]
+    v_sub = v[::2, ::2]
+    uv = np.empty((h // 2, w // 2, 2), dtype=np.uint8)
+    uv[..., 0] = u_sub
+    uv[..., 1] = v_sub
+
+    nv12 = np.empty((h * 3 // 2, w), dtype=np.uint8)
+    nv12[:h] = y
+    nv12[h:] = uv.reshape(h // 2, w)
+    return nv12
 
 
 def mpp_buffer_sync_cpu_read(buf):
