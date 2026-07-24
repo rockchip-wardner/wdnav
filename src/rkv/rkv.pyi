@@ -119,7 +119,10 @@ class VideoCapture:
 
 class VideoWriter:
     CODEC_H264: str
+    CODEC_H264_RAW: str
+    CODEC_HEVC_RAW: str
     CODEC_MJPEG: str
+    CODEC_JPEG: str
     CODEC_MP4V: str
 
     PROFILE_BASELINE: str
@@ -155,7 +158,7 @@ class VideoWriter:
         q_factor: int = ...,
     ) -> None: ...
     def write(self, frame: np.ndarray | "DecodedFrame") -> None: ...
-    backend: str  # "mpp" | "pyav" | "ws-jpeg"
+    backend: str
     def release(self) -> None: ...
     def __enter__(self) -> "VideoWriter": ...
     def __exit__(self, *exc) -> None: ...

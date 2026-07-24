@@ -279,7 +279,10 @@ class VideoWriter:
     """
 
     CODEC_H264 = "h264"
+    CODEC_H264_RAW = "h264_raw"
+    CODEC_HEVC_RAW = "hevc_raw"
     CODEC_MJPEG = "mjpeg"
+    CODEC_JPEG = "jpeg"
     CODEC_MP4V = "mp4v"
 
     PROFILE_BASELINE = "baseline"
@@ -305,13 +308,20 @@ class VideoWriter:
         rc_mode: str = "cbr",
         q_factor: int = 80,
     ) -> None:
-        if codec not in (self.CODEC_H264, self.CODEC_MJPEG, self.CODEC_MP4V):
+        if codec not in (
+            self.CODEC_H264,
+            self.CODEC_H264_RAW,
+            self.CODEC_HEVC_RAW,
+            self.CODEC_MJPEG,
+            self.CODEC_JPEG,
+            self.CODEC_MP4V,
+        ):
             raise ValueError(f"unsupported codec: {codec!r}")
-        if codec == self.CODEC_H264 and profile not in _H264_PROFILE_BY_NAME:
+        if codec in (self.CODEC_H264, self.CODEC_H264_RAW) and profile not in _H264_PROFILE_BY_NAME:
             raise ValueError(f"unsupported profile: {profile!r}")
         if rc_mode not in (self.RC_VBR, self.RC_CBR, self.RC_FIXQP, self.RC_AVBR):
             raise ValueError(f"unsupported rc_mode: {rc_mode!r}")
-        if codec == self.CODEC_MJPEG and not 1 <= q_factor <= 99:
+        if codec in (self.CODEC_MJPEG, self.CODEC_JPEG) and not 1 <= q_factor <= 99:
             raise ValueError(
                 f"q_factor must be in 1..99 for codec={codec!r}, got {q_factor!r}"
             )
@@ -340,7 +350,11 @@ class VideoWriter:
         self._container = None
         self._stream = None
         self._ws_pts_us = 0
-        self._backend: str = ""  # "mpp" | "mpp-mjpeg" | "pyav" | "ws-jpeg" | "ws-h264-mpp"
+        self._backend: str = ""
+        self._raw_file = None
+        self._raw_extradata: bytes = b""
+        self._raw_extradata_written: bool = False
+        self._raw_single_frame_written: bool = False
 
         if path.startswith("rkv+ws://"):
             # Open the WS sink immediately so writes can flow as soon
@@ -378,6 +392,35 @@ class VideoWriter:
         # PyAV is only used for demux/mux. Each MJPEG packet is a
         # complete JPEG with SOI/EOI markers, which matches the layout
         # AVI's MJPEG stream expects.
+        if codec in (self.CODEC_H264_RAW, self.CODEC_HEVC_RAW):
+            try:
+                self._init_mpp_raw_video(path)
+            except Exception as e:
+                name = "H.264" if codec == self.CODEC_H264_RAW else "HEVC"
+                raise RuntimeError(
+                    f"rkv.VideoWriter: raw {name} encoding requires MPP "
+                    f"hardware encoder but initialization failed: {e}."
+                ) from e
+            self._backend = (
+                "mpp-h264-raw"
+                if codec == self.CODEC_H264_RAW
+                else "mpp-hevc-raw"
+            )
+            self._is_open = True
+            return
+
+        if codec == self.CODEC_JPEG:
+            try:
+                self._init_mpp_raw_jpeg(path)
+            except Exception as e:
+                raise RuntimeError(
+                    f"rkv.VideoWriter: raw JPEG encoding requires MPP "
+                    f"hardware encoder but initialization failed: {e}."
+                ) from e
+            self._backend = "mpp-jpeg"
+            self._is_open = True
+            return
+
         if codec == self.CODEC_H264:
             try:
                 self._init_mpp(path)
@@ -463,6 +506,33 @@ class VideoWriter:
         out_dir = os.path.dirname(os.path.abspath(path))
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
+
+        if codec in (self.CODEC_H264_RAW, self.CODEC_HEVC_RAW):
+            try:
+                self._init_mpp_raw_video(path)
+            except Exception as e:
+                name = "H.264" if codec == self.CODEC_H264_RAW else "HEVC"
+                raise RuntimeError(
+                    f"rkv.VideoWriter: raw {name} encoding requires MPP "
+                    f"hardware encoder but initialization failed: {e}."
+                ) from e
+            self._backend = (
+                "mpp-h264-raw"
+                if codec == self.CODEC_H264_RAW
+                else "mpp-hevc-raw"
+            )
+            return
+
+        if codec == self.CODEC_JPEG:
+            try:
+                self._init_mpp_raw_jpeg(path)
+            except Exception as e:
+                raise RuntimeError(
+                    f"rkv.VideoWriter: raw JPEG encoding requires MPP "
+                    f"hardware encoder but initialization failed: {e}."
+                ) from e
+            self._backend = "mpp-jpeg"
+            return
 
         if codec == self.CODEC_H264:
             try:
@@ -711,6 +781,46 @@ class VideoWriter:
         """
         self._make_mpp_mjpeg_encoder()
 
+    def _init_mpp_raw_video(self, path: str) -> None:
+        from .mpp import MppCodingType, MppEncoder
+
+        coding = (
+            MppCodingType.AVC
+            if self._codec == self.CODEC_H264_RAW
+            else MppCodingType.HEVC
+        )
+        self._encoder = MppEncoder(
+            coding_type=coding,
+            width=self._width,
+            height=self._height,
+            fps=self._fps,
+            bitrate=self._bitrate,
+            gop=self._gop,
+            profile=self._profile_name,
+            rc_mode=self._rc_mode.lower(),
+        )
+        self._raw_file = open(path, "wb")
+        self._raw_extradata = self._encoder.extradata or b""
+        self._raw_extradata_written = False
+        self._pts = 0
+
+    def _init_mpp_raw_jpeg(self, path: str) -> None:
+        from .mpp import MppCodingType, MppEncoder, MppFrameFormat
+
+        self._encoder = MppEncoder(
+            coding_type=MppCodingType.MJPEG,
+            width=self._width,
+            height=self._height,
+            fps=max(self._fps, 1),
+            gop=self._gop,
+            input_format=MppFrameFormat.BGR888,
+            rc_mode="fixqp",
+            q_factor=self._q_factor,
+        )
+        self._raw_file = open(path, "wb")
+        self._pts = 0
+        self._raw_single_frame_written = False
+
     def _init_pyav(self, path: str) -> None:
         """Open the file using PyAV's built-in encoders.
 
@@ -896,7 +1006,8 @@ class VideoWriter:
             self._encoder is not None
             and is_decoded_frame
             and getattr(frame, "fd", -1) >= 0
-            and self._backend != "mpp-mjpeg"
+            and self._backend
+            not in ("mpp-mjpeg", "mpp-jpeg")
         ):
             try:
                 from .mpp import MppFrameFormat
@@ -910,7 +1021,12 @@ class VideoWriter:
                     input_format=MppFrameFormat.YUV420SP,
                     pts=int(frame.pts or self._pts),
                 )
-                self._send_mpp_packet(pkt)
+                if self._backend == "mpp-h264-raw":
+                    self._send_mpp_raw_video_packet(pkt)
+                elif self._backend == "mpp-hevc-raw":
+                    self._send_mpp_raw_video_packet(pkt)
+                else:
+                    self._send_mpp_packet(pkt)
                 return
             except RuntimeError as e:
                 # Zero-copy path failed (e.g. format mismatch on a
@@ -948,6 +1064,12 @@ class VideoWriter:
                     pixels = frame.numpy(fmt="NV12")
                 else:
                     pixels = frame
+            elif self._backend == "mpp-jpeg":
+                pixels = (
+                    self._decoded_frame_to_bgr(frame)
+                    if is_decoded_frame
+                    else frame
+                )
             else:
                 pixels = (
                     self._decoded_frame_to_bgr(frame)
@@ -975,6 +1097,10 @@ class VideoWriter:
                 # with no start codes to strip and no NAL structure.
                 self._send_mpp_mjpeg_packet(pkt)
                 self._mpp_mjpeg_frame_count += 1
+            elif self._backend in ("mpp-h264-raw", "mpp-hevc-raw"):
+                self._send_mpp_raw_video_packet(pkt)
+            elif self._backend == "mpp-jpeg":
+                self._send_mpp_raw_jpeg_packet(pkt)
             else:
                 self._send_mpp_packet(pkt)
             return
@@ -1030,11 +1156,28 @@ class VideoWriter:
                             self._send_mpp_mjpeg_packet(tail)
                     except Exception:
                         pass
+                elif self._backend in ("mpp-h264-raw", "mpp-hevc-raw"):
+                    try:
+                        tail = self._encoder.flush()
+                        if tail is not None and tail.data:
+                            self._send_mpp_raw_video_packet(tail)
+                    except Exception:
+                        pass
                 try:
                     self._encoder.close()
                 except Exception:
                     pass
                 self._encoder = None
+            if self._raw_file is not None:
+                try:
+                    self._raw_file.flush()
+                except Exception:
+                    pass
+                try:
+                    self._raw_file.close()
+                except Exception:
+                    pass
+                self._raw_file = None
         except Exception:
             pass
 
@@ -1047,6 +1190,42 @@ class VideoWriter:
         self.release()
 
     # -- internals ---------------------------------------------------------
+
+    def _send_mpp_raw_video_packet(self, pkt) -> None:
+        if not pkt.data or self._raw_file is None:
+            return
+        nals = _parse_annexb_nals(pkt.data)
+        if not nals:
+            raise RuntimeError("MPP returned a non-Annex-B video packet")
+        if not self._raw_extradata_written:
+            if self._codec == self.CODEC_H264_RAW:
+                nal_types = {nal_type for _, _, nal_type in nals}
+                has_header = {7, 8}.issubset(nal_types)
+            else:
+                nal_types = {
+                    (pkt.data[start] >> 1) & 0x3F
+                    for start, _, _ in nals
+                }
+                has_header = {32, 33, 34}.issubset(nal_types)
+            if self._raw_extradata and not has_header:
+                self._raw_file.write(self._raw_extradata)
+            self._raw_extradata_written = True
+        self._raw_file.write(pkt.data)
+        self._pts += 1
+
+    def _send_mpp_raw_jpeg_packet(self, pkt) -> None:
+        if not pkt.data or self._raw_file is None:
+            return
+        start = pkt.data.find(b"\xff\xd8")
+        end = pkt.data.rfind(b"\xff\xd9")
+        if start < 0 or end < start:
+            raise RuntimeError("MPP returned an invalid JPEG packet")
+        self._raw_file.seek(0)
+        self._raw_file.truncate()
+        self._raw_file.write(pkt.data[start:end + 2])
+        self._raw_file.flush()
+        self._raw_single_frame_written = True
+        self._pts += 1
 
     def _send_mpp_packet(self, pkt) -> None:
         """Mux one :class:`EncodedPacket` from MPP into the PyAV container.
