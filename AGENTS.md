@@ -46,6 +46,7 @@ MPP / RGA / V4L2 / DmaHeap / GPU Python binding (import name `rkv`, distribution
   mpp只允许阅读他的test、utils、inc目录，其他目录禁止阅读
 - 除非要给cv2使用，否则不建议用read接口或者保存numpy数组，这样会造成下次硬件使用时候只能从虚拟地址获取内容，效率很低，建议用read0接口
 - 除非要给cv2使用，否则不是用BGR格式保存，硬件编解码对NV12更加友好
+- 编码除jpeg用FIXQP模式外，其余都用CBR
 
 ### 视频解码
 
@@ -70,3 +71,4 @@ out.write(frame0)  # 0拷贝接口，传入dmabuffer结构体
 
 - 用中文回答
 - 除非我要求，否则不要自动提交git commit
+- 由于视频编码出现python调用mpp和c调用mpp得到的sps pps不一致问题，所以我们封装一层高级的c shim接口给python调用

@@ -59,9 +59,12 @@ Homepage = "https://example.com/pyrkv"
 Issues = "https://example.com/pyrkv/issues"
 
 # ---------------------------------------------------------------------------
-# setuptools 配置：纯 Python 包。native 库（librockchip_mpp / librga）
-# **不**随 wheel 发布，必须由用户在系统层面安装，由 ctypes 通过
-# ldconfig / /usr/lib/... 加载。
+# setuptools 配置：纯 Python 包 + 两个 C shim
+# (``src/rkv/cshim_video_encoder.c`` + ``src/rkv/cshim_video_decoder.c``)
+# 编译产物 (``src/rkv/lib/libshim_video.so``) 由 ``build_rkv.py`` 在 wheel
+# 打包之前自动编译出来，libshim_video.so 随 wheel 一起发布；native 上游
+# 库（librockchip_mpp）**不**随 wheel 发布，必须由用户在系统层面安装，
+# shim 通过 dlopen 加载它。
 # ---------------------------------------------------------------------------
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -73,7 +76,27 @@ include = ["rkv*"]
 [tool.setuptools.package-data]
 rkv = [
     "py.typed",
+    "lib/libshim_video.so",
 ]
+
+[tool.setuptools.exclude-package-data]
+rkv = [
+    "*.c",
+    "*.so.bak",
+]
+
+# Custom build_py subclass that compiles the C shim before Python
+# packaging. See ``build_rkv.py`` at the project root for the full
+# rationale (why a top-level module, why a manual subprocess instead
+# of ``Extension`` / ``build_ext``, and why the output lands inside
+# ``src/rkv/lib/`` rather than ``build/``).
+#
+# The cmdclass value is a ``module.ClassName`` dotted identifier, NOT
+# the more familiar ``module:ClassName`` form — setuptools' pyproject
+# schema uses the dotted form (`python-qualified-identifier` format)
+# and rejects the colon form.
+[tool.setuptools.cmdclass]
+build_py = "rkv._build_rkv.build_py"
 
 # ---------------------------------------------------------------------------
 # 常用工具配置
