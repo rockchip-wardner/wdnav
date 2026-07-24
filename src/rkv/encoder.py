@@ -18,9 +18,8 @@ encoded byte stream comes from one backend:
   ``codec="h264"`` on a box where :class:`rkv.mpp.MppEncoder` can't
   initialise (no Rockchip SoC, or an MPP build that rejects the
   requested width / profile) raises ``RuntimeError`` at construction
-  time. The non-H.264 codecs (``mp4v`` for local files,
-  ``mjpeg`` for ``rkv+ws://``) still go through PyAV's own
-  built-in encoders — those don't need libx264.
+  time. There is no software codec fallback — every codec goes
+  through MPP, and on non-Rockchip boxes the constructor raises.
 
 The ``rkv+ws://`` sink supports two wire formats:
 
@@ -36,7 +35,7 @@ Public API mirrors OpenCV's ``VideoWriter`` so existing call sites
 work unchanged:
 
     out = VideoWriter("/tmp/out.mp4", fps=30, frame_size=(640, 360),
-                      codec="mp4v", gop=30, bitrate=2_000_000)
+                      codec="h264", gop=30, bitrate=2_000_000)
     out.write(frame)                # BGR (H, W, 3) uint8 ndarray
     out.write(frame0)              # DecodedFrame with .fd (zero-copy)
 
@@ -57,7 +56,6 @@ Copy budget by path
   |-------------------------|-----------:|-----------:|
   | MPP zero-copy (DMA-BUF) |          0 |  VPU only  |
   | MPP eager BGR           |          1 |  VPU only  |
-  | PyAV mp4v / mjpeg      |          1 |  PyAV      |
 
 The MPP zero-copy path is the headline: only the VPU and the encoder
 DMA engine touch the pixel data, the CPU never sees it. The single
@@ -120,6 +118,40 @@ _H264_PROFILE_BY_NAME = {
     "baseline": 66,
     "main": 77,
     "high": 100,
+}
+
+
+# Default codec inferred from the output file extension when the caller
+# doesn't pass ``codec=``. Mapping is intentionally conservative —
+# extensions that universally mean "raw Annex B bitstream" (``.264``,
+# ``.265``) get the matching raw codec; container extensions default
+# to ``h264`` (MP4-muxed). The full table:
+#
+#   .264 / .h264  →  h264_raw   (raw H.264 Annex B)
+#   .265 / .hevc  →  hevc_raw   (raw HEVC Annex B)
+#   .jpg / .jpeg  →  jpeg       (raw JPEG)
+#   .mjpeg       →  mjpeg       (MJPEG)
+#   .mp4 / .mov  →  h264        (H.264 in MP4 container)
+#   .mkv / .webm →  h264        (H.264 in Matroska container)
+#   .avi         →  mjpeg       (MJPEG in AVI — historically what
+#                                  OpenCV / FFmpeg default to)
+#
+# Unknown extensions default to ``h264`` so an explicit ``codec=``
+# override isn't required for ``rkv+ws://`` URIs either.
+_DEFAULT_CODEC_BY_EXT = {
+    "264": "h264_raw",
+    "h264": "h264_raw",
+    "265": "hevc_raw",
+    "hevc": "hevc_raw",
+    "jpg": "jpeg",
+    "jpeg": "jpeg",
+    "mjpeg": "mjpeg",
+    "mjpg": "mjpeg",
+    "mp4": "h264",
+    "mov": "h264",
+    "mkv": "h264",
+    "webm": "h264",
+    "avi": "mjpeg",
 }
 
 
@@ -258,12 +290,23 @@ class VideoWriter:
         frame.shape[0])``. The width and height of every subsequent
         frame must match the first one.
     codec:
-        ``"h264"`` (default, MPP hardware only — requires a
-        Rockchip SoC; raises on non-MPP platforms), ``"mjpeg"``
-        (Motion JPEG in AVI, PyAV software), ``"mp4v"`` (MPEG-4
-        Part 2 in MP4, PyAV software). ``"h264"`` selects the 
-        H.264 wire format described in :mod:`rkv.encoder`'s module 
-        docstring.
+        Codec to encode with. When ``None`` (the default), the codec
+        is inferred from ``path``'s extension: ``.264`` / ``.h264``
+        → ``"h264_raw"`` (raw H.264 Annex B bitstream); ``.265`` /
+        ``.hevc`` → ``"hevc_raw"``; ``.jpg`` / ``.jpeg`` → ``"jpeg"``;
+        ``.mp4`` / ``.mov`` / ``.mkv`` / ``.webm`` → ``"h264"``
+        (H.264 muxed into the corresponding container); ``.avi`` →
+        ``"mjpeg"``. Unknown extensions fall back to ``"h264"``.
+
+        Recognised values when passed explicitly:
+
+        * ``"h264"`` — H.264 in MP4 / Matroska / AVI container
+          (MPP hardware only — requires a Rockchip SoC; raises on
+          non-MPP platforms).
+        * ``"h264_raw"`` — raw H.264 Annex B bitstream (MPP hardware).
+        * ``"hevc_raw"`` — raw HEVC Annex B bitstream (MPP hardware).
+        * ``"mjpeg"`` — Motion JPEG in AVI container (MPP hardware).
+        * ``"jpeg"`` — single-frame JPEG (MPP hardware).
     profile:
         H.264 profile: ``"baseline"`` (default, no B-frames, lowest
         latency), ``"main"``, ``"high"``. Recorded; the backend
@@ -283,7 +326,6 @@ class VideoWriter:
     CODEC_HEVC_RAW = "hevc_raw"
     CODEC_MJPEG = "mjpeg"
     CODEC_JPEG = "jpeg"
-    CODEC_MP4V = "mp4v"
 
     PROFILE_BASELINE = "baseline"
     PROFILE_MAIN = "main"
@@ -294,13 +336,28 @@ class VideoWriter:
     RC_FIXQP = "fixqp"
     RC_AVBR = "avbr"
 
+    @staticmethod
+    def _codec_from_path(path: str) -> str:
+        """Return the codec that ``path`` most naturally expects.
+
+        Used as the default when the caller doesn't pass ``codec=``
+        to :meth:`__init__`. The mapping is in ``_DEFAULT_CODEC_BY_EXT``;
+        unknown extensions fall back to ``"h264"`` so the writer is
+        always usable. ``rkv+ws://`` URIs always default to ``"h264"``
+        — the wire-format protocol's most common codec.
+        """
+        if path.startswith("rkv+ws://"):
+            return VideoWriter.CODEC_H264
+        ext = os.path.splitext(path)[1].lstrip(".").lower()
+        return _DEFAULT_CODEC_BY_EXT.get(ext, VideoWriter.CODEC_H264)
+
     def __init__(
         self,
         path: str,
         fps: int = 30,
         frame_size: Tuple[int, int] = (0, 0),
         *,
-        codec: str = "h264",
+        codec: Optional[str] = None,
         profile: str = "baseline",
         bitrate: int = 2_000_000,
         gop: int = 30,
@@ -308,13 +365,20 @@ class VideoWriter:
         rc_mode: str = "cbr",
         q_factor: int = 80,
     ) -> None:
+        # ``codec=None`` means "infer from the output file extension"
+        # — e.g. ``./test.264`` → raw H.264 Annex B, ``./test.mp4`` →
+        # H.264 in an MP4 container. The legacy hard-coded default
+        # (``"h264"``) was misleading for the common ``.264`` use case:
+        # it produced an MP4 file even though the convention is that
+        # ``.264`` files are raw H.264 bitstreams.
+        if codec is None:
+            codec = self._codec_from_path(path)
         if codec not in (
             self.CODEC_H264,
             self.CODEC_H264_RAW,
             self.CODEC_HEVC_RAW,
             self.CODEC_MJPEG,
             self.CODEC_JPEG,
-            self.CODEC_MP4V,
         ):
             raise ValueError(f"unsupported codec: {codec!r}")
         if codec in (self.CODEC_H264, self.CODEC_H264_RAW) and profile not in _H264_PROFILE_BY_NAME:
@@ -428,8 +492,7 @@ class VideoWriter:
                 raise RuntimeError(
                     f"rkv.VideoWriter: H.264 local-file encoding requires "
                     f"MPP hardware encoder but MppEncoder.init failed: "
-                    f"{e}. Use codec='mp4v' for a PyAV software path, or "
-                    f"run on Rockchip hardware."
+                    f"{e}. Run on Rockchip hardware."
                 ) from e
             self._backend = "mpp"
             self._is_open = True
@@ -442,16 +505,13 @@ class VideoWriter:
                 raise RuntimeError(
                     f"rkv.VideoWriter: MJPEG local-file encoding requires "
                     f"MPP hardware JPEG encoder but MppEncoder.init failed: "
-                    f"{e}. Use codec='mp4v' for an MPEG-4 Part 2 software "
-                    f"path on non-MPP platforms."
+                    f"{e}. Run on Rockchip hardware."
                 ) from e
             self._backend = "mpp-mjpeg"
             self._is_open = True
             return
 
-        self._init_pyav(path)
-        self._backend = "pyav"
-        self._is_open = True
+        raise ValueError(f"unsupported codec: {codec!r}")
 
     def _init_from_frame(self, frame) -> None:
         """Initialise the deferred backend using the size of the first frame.
@@ -541,8 +601,7 @@ class VideoWriter:
                 raise RuntimeError(
                     f"rkv.VideoWriter: H.264 local-file encoding requires "
                     f"MPP hardware encoder but MppEncoder.init failed: "
-                    f"{e}. Use codec='mp4v' for a PyAV software path, or "
-                    f"run on Rockchip hardware."
+                    f"{e}. Run on Rockchip hardware."
                 ) from e
             self._backend = "mpp"
             return
@@ -554,14 +613,12 @@ class VideoWriter:
                 raise RuntimeError(
                     f"rkv.VideoWriter: MJPEG local-file encoding requires "
                     f"MPP hardware JPEG encoder but MppEncoder.init failed: "
-                    f"{e}. Use codec='mp4v' for an MPEG-4 Part 2 software "
-                    f"path on non-MPP platforms."
+                    f"{e}. Run on Rockchip hardware."
                 ) from e
             self._backend = "mpp-mjpeg"
             return
 
-        self._init_pyav(path)
-        self._backend = "pyav"
+        raise ValueError(f"unsupported codec: {codec!r}")
 
     # -- properties ---------------------------------------------------------
 
@@ -596,7 +653,9 @@ class VideoWriter:
     @property
     def backend(self) -> str:
         """Which encoder path the writer ended up using (``"mpp"`` /
-        ``"pyav"`` / ``"ws-jpeg"``). Useful for diagnostics."""
+        ``"mpp-mjpeg"`` / ``"mpp-h264-raw"`` / ``"mpp-hevc-raw"`` /
+        ``"mpp-jpeg"`` / ``"ws-h264-mpp"`` / ``"ws-jpeg"``). Useful
+        for diagnostics."""
         return self._backend
 
     @property
@@ -612,10 +671,10 @@ class VideoWriter:
 
         * the MPP hardware encoder (H.264 via the VPU),
         * a PyAV container chosen from the file extension — the same
-          convention :meth:`_init_mpp_mjpeg` and :meth:`_init_pyav`
-          use. ``.mp4`` / ``.mov`` map to ``format="mp4"``; ``.mkv``
-          maps to ``format="matroska"``. Unrecognised extensions
-          fall back to MP4 (matching the historical default).
+          convention :meth:`_init_mpp_mjpeg` uses. ``.mp4`` / ``.mov``
+          map to ``format="mp4"``; ``.mkv`` maps to ``format="matroska"``.
+          Unrecognised extensions fall back to MP4 (matching the
+          historical default).
         * an avcC extradata captured from the encoder's
           ``MPP_ENC_GET_HDR_SYNC`` so PyAV writes a valid MP4 with
           the ``avc1`` atom at the head. Skipped for matroska (it
@@ -821,52 +880,6 @@ class VideoWriter:
         self._pts = 0
         self._raw_single_frame_written = False
 
-    def _init_pyav(self, path: str) -> None:
-        """Open the file using PyAV's built-in encoders.
-
-        Supports only ``mp4v`` (``mpeg4``). H.264 is MPP-only (see
-        :meth:`_init_mpp`); MJPEG is also MPP-only on the local-file
-        path (see :meth:`_init_mpp_mjpeg`). PyAV's software encoder is
-        reserved for codecs MPP doesn't have an accelerator for.
-        """
-        av = _import_av()
-        codec_map = {
-            self.CODEC_MP4V: ("mpeg4", "yuv420p"),
-        }
-        if self._codec in (self.CODEC_H264, self.CODEC_MJPEG):
-            raise RuntimeError(
-                f"VideoWriter._init_pyav called for codec={self._codec!r} — "
-                f"that path should be routed through _init_mpp / "
-                f"_init_mpp_mjpeg. This is a bug."
-            )
-        if self._codec not in codec_map:
-            raise ValueError(f"unsupported codec for PyAV path: {self._codec!r}")
-        codec_name, pix_fmt = codec_map[self._codec]
-        # Choose container format from the file extension; default to
-        # MP4 if PyAV can't autodetect.
-        ext = os.path.splitext(path)[1].lstrip(".").lower()
-        container_format = {
-            "mp4": "mp4",
-            "mov": "mp4",
-            "mkv": "matroska",
-            "avi": "avi",
-        }.get(ext)
-
-        if container_format:
-            self._container = av.open(path, "w", format=container_format)
-        else:
-            self._container = av.open(path, "w")
-        self._stream = self._container.add_stream(codec_name, rate=self._fps)
-        self._stream.width = self._width
-        self._stream.height = self._height
-        self._stream.pix_fmt = pix_fmt
-        if self._bitrate:
-            self._stream.bit_rate = self._bitrate
-        self._stream.options = {"g": str(self._gop)}
-        # For PyAV to encode a BGR ndarray we need to convert to the
-        # stream's pix_fmt. The write path handles that.
-        self._encoder = None
-
     def _init_ws_h264(self) -> None:
         """Initialize an H.264 stream over the WebSocket sink.
 
@@ -899,13 +912,12 @@ class VideoWriter:
                 gop=self._gop,
                 profile=self._profile_name,
                 # H.264 over the WS sink is fixed to CBR — the "default"
-                # rc preset we bind below doesn't reliably produce IDR
+#                 rc preset we bind below doesn't reliably produce IDR
                 # frames under VBR on this firmware, which leaves the
                 # browser decoder stuck waiting for its first keyframe
                 # (manifesting as a black screen). CBR's narrower rate
-                # range keeps the preset happy. ``mjpeg`` skips MPP
-                # entirely (PyAV software path) and uses FIXQP for
-                # deterministic per-frame quality.
+                # range keeps the preset happy. ``mjpeg`` uses FIXQP
+                # for deterministic per-frame quality.
                 rc_mode="fixqp" if self._codec == self.CODEC_MJPEG else "cbr",
             )
         except Exception as e:
@@ -968,11 +980,10 @@ class VideoWriter:
             initialised for BGR. This is still one RGA pass, no
             BGR round-trip.
 
-        The PyAV software backend (``mp4v`` / ``mjpeg``) always
-        operates on a BGR ndarray; a ``DecodedFrame`` input is
-        converted via :meth:`numpy` (one RGA DMA copy) before
-        reaching the encoder. There is no software backend for
-        ``h264`` — that path requires MPP.
+        The MPP backend always operates on a BGR ndarray; a
+        :class:`DecodedFrame` input is converted via :meth:`numpy`
+        (one RGA DMA copy) before reaching the encoder. There is no
+        software backend for any codec — every path requires MPP.
         """
         if not self.isOpened:
             raise RuntimeError("VideoWriter is closed")
@@ -986,7 +997,7 @@ class VideoWriter:
             self._pending_init = False
 
         if self._ws_sink is not None:
-            if self._backend in ("ws-h264-mpp", "ws-h264-pyav"):
+            if self._backend == "ws-h264-mpp":
                 self._send_ws_h264(frame)
             else:
                 self._send_ws_jpeg(frame)
@@ -1002,6 +1013,14 @@ class VideoWriter:
         # external DMA-BUF trips ``mpp_enc_check_pkt_buf`` and the
         # process aborts before the try/except in Python can catch
         # anything. MJPEG takes the NV12 short path below instead.
+        #
+        # ``input_format`` follows ``frame.fmt`` (the MPP format code
+        # the decoder attached to this frame — usually NV12, but
+        # BGR/NV21/I420 are all possible if a downstream RGA step
+        # re-emitted them). Defaulting to YUV420SP silently mis-typed
+        # the encoder when the decoder happened to emit something
+        # else (e.g. a custom ISP pipeline that already produced
+        # NV21).
         if (
             self._encoder is not None
             and is_decoded_frame
@@ -1018,7 +1037,9 @@ class VideoWriter:
                     height=int(frame.height),
                     hor_stride=int(frame.hor_stride or frame.width),
                     ver_stride=int(frame.ver_stride or frame.height),
-                    input_format=MppFrameFormat.YUV420SP,
+                    input_format=int(
+                        getattr(frame, "fmt", MppFrameFormat.YUV420SP)
+                    ),
                     pts=int(frame.pts or self._pts),
                 )
                 if self._backend == "mpp-h264-raw":
@@ -1104,17 +1125,6 @@ class VideoWriter:
             else:
                 self._send_mpp_packet(pkt)
             return
-
-        # PyAV software path. Always operate on a BGR ndarray.
-        bgr = self._decoded_frame_to_bgr(frame) if is_decoded_frame else frame
-        if not bgr.flags.c_contiguous:
-            bgr = np.ascontiguousarray(bgr)
-        # av.VideoFrame.from_ndarray accepts rgb24/bgr24/etc; we always
-        # feed bgr24 because that's what VideoCapture produces. PyAV
-        # handles the BGR→YUV conversion inside stream.encode().
-        av_frame = _import_av().VideoFrame.from_ndarray(bgr, format="bgr24")
-        for pkt in self._stream.encode(av_frame):
-            self._container.mux(pkt)
 
     def release(self) -> None:
         if not self._is_open:
@@ -1230,18 +1240,27 @@ class VideoWriter:
     def _send_mpp_packet(self, pkt) -> None:
         """Mux one :class:`EncodedPacket` from MPP into the PyAV container.
 
-        PyAV 主分支 PR #2305 路径：mp4 / matroska muxer 走
-        ``extract_extradata`` BSF，需要 **length-prefixed** NALs（4 字节
-        big-endian 长度 + payload）。把 MPP 输出的 Annex-B 转 length-prefixed
-        后，第一帧额外 prepend 一次 SPS/PPS，让 BSF 能抽到正确 SPS/PPS
-        写到 codecpar.extradata；后续帧不再 prepend。
+        Both mp4 and matroska muxers want the access unit in **Annex-B
+        format** (``00 00 00 01`` start-code-prefixed NALs) and want
+        SPS / PPS to appear in the bitstream — either in
+        ``codecpar.extradata`` (set by PyAV's ``extract_extradata`` BSF
+        for GLOBALHEADER containers) or prepended in-band. MPP emits
+        the access unit in Annex-B already, so we hand it through
+        unchanged; on the first frame we additionally prepend the
+        SPS / PPS NALs from the encoder's ``extradata`` (also in
+        Annex-B), which lets the muxer build a clean ``avcC`` /
+        CodecPrivate from the bitstream. Stripping the start codes
+        into 4-byte length-prefixed form (the earlier approach)
+        breaks matroska, whose muxer only re-parses Annex-B NALs
+        when the SPS / PPS it sees look like Annex-B; sending
+        length-prefixed payloads makes it bail with
+        ``AVERROR_INVALIDDATA`` during ``avformat_write_header``.
         """
         if not pkt.data:
             return
-        payload, _ = _strip_annexb(pkt.data)
+        payload = pkt.data
         if self._mpp_matroska_header:
-            _, sps_pps = _strip_annexb(self._mpp_matroska_header)
-            payload = sps_pps + payload
+            payload = self._mpp_matroska_header + payload
             self._mpp_matroska_header = b""
         av = _import_av()
         packet = av.Packet(payload)
@@ -1407,7 +1426,9 @@ class VideoWriter:
                     height=int(frame.height),
                     hor_stride=int(frame.hor_stride or frame.width),
                     ver_stride=int(frame.ver_stride or frame.height),
-                    input_format=MppFrameFormat.YUV420SP,
+                    input_format=int(
+                        getattr(frame, "fmt", MppFrameFormat.YUV420SP)
+                    ),
                     pts=self._ws_pts_us,
                 )
             except RuntimeError as e:

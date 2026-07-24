@@ -41,7 +41,7 @@ MPP / RGA / V4L2 / DmaHeap / GPU Python binding (import name `rkv`, distribution
 
 - 兼容cv2,但不重复调用cv2，rkv不对cv2做任何依赖
 - 使用pyav做握手和demux，不使用pyav和libx264做任何编解码操作，编解码由mpp来完成
-- 不做任何软解和软拷贝的fallback操作，如果mpp、rga、mali库都完不成的操作就直接报错，不要用pyav来做jpeg编解码操作
+- 不做任何软解和软拷贝的fallback操作，不做任何兜底操作，如果mpp、rga、mali库都完不成的操作就直接报错，不要用pyav来做jpeg、264、265等软件编解码
 - 在封装和调试mpp和rga库时候，仅参考他们的sample和test源码以及公共头文件部分，不要去阅读任何mpp和rga实现的源码
   mpp只允许阅读他的test、utils、inc目录，其他目录禁止阅读
 - 除非要给cv2使用，否则不建议用read接口或者保存numpy数组，这样会造成下次硬件使用时候只能从虚拟地址获取内容，效率很低，建议用read0接口

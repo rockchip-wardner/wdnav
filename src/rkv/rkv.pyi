@@ -123,7 +123,6 @@ class VideoWriter:
     CODEC_HEVC_RAW: str
     CODEC_MJPEG: str
     CODEC_JPEG: str
-    CODEC_MP4V: str
 
     PROFILE_BASELINE: str
     PROFILE_MAIN: str
@@ -149,7 +148,7 @@ class VideoWriter:
         fps: int = ...,
         frame_size: tuple[int, int] = ...,
         *,
-        codec: str = ...,
+        codec: str | None = ...,
         profile: str = ...,
         bitrate: int = ...,
         gop: int = ...,
