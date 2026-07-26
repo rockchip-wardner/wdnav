@@ -724,14 +724,36 @@ class VideoWriter:
         # pass width/height/pix_fmt/time_base as kwargs (they end up on
         # the stream's ``codecpar``); the codec itself is ``h264`` so
         # both mp4 and matroska pick the right muxer defaults.
+        #
+        # ``time_base`` is intentionally 1/90000 (MPEG-TS timescale)
+        # rather than 1/fps. FFmpeg's MP4 muxer upsamples
+        # ``st->time_base.den`` to >= 10000 in ``movenc.c``'s
+        # ``track->timescale`` loop (``den; den *= 2`` until >= 10000),
+        # which for ``1/30`` lands on ``1/15360`` (= 30 × 2⁹). The
+        # muxer rebases the stream's ``time_base`` to that value but
+        # does NOT rescale already-written stts packet timestamps, so
+        # packets whose pts we hand in as a frame counter (0, 1, 2, …
+        # in 1/30 ticks) end up stored as if they were in 1/15360 ticks
+        # and demuxers report a 512× sped-up video (cv2 sees fps=15360,
+        # total duration ≈ 18 ms for 277 frames). Using a non-integer
+        # ``time_base`` that's already >= 10000 keeps the muxer from
+        # touching it; ``_send_mpp_packet`` then converts the frame
+        # counter into 90 kHz ticks so the stored timestamps decode
+        # back to the correct playback time.
         self._stream = self._container.add_mux_stream(
             "h264",
             rate=self._fps,
             width=self._width,
             height=self._height,
             pix_fmt="yuv420p",
-            time_base=fractions.Fraction(1, self._fps),
+            time_base=fractions.Fraction(1, 90000),
         )
+        # Stride between adjacent frame PTS in 90 kHz ticks — i.e.
+        # the number of 1/90000 s units in one frame interval at
+        # ``self._fps``. ``_send_mpp_packet`` reads this and writes
+        # the packet's ``pts`` / ``dts`` / ``duration`` in these units
+        # so the muxer stores the right stts entries.
+        self._pts_tick_stride = 90000 // self._fps if self._fps > 0 else 3000
 
     def _init_mpp_mjpeg(self, path: str, *, q_factor: int = 80) -> None:
         """Open the file for MPP-encoded MJPEG output.
@@ -1264,11 +1286,18 @@ class VideoWriter:
             self._mpp_matroska_header = b""
         av = _import_av()
         packet = av.Packet(payload)
-        # PTS / DTS are frame indices in ``time_base`` ticks (which is
-        # ``1 / fps`` seconds on this stream). One frame per tick.
-        packet.pts = self._pts
-        packet.dts = self._pts
-        packet.duration = 1
+        # PTS / DTS / duration live in the stream's ``time_base`` ticks.
+        # The stream was created with ``time_base = 1/90000`` (see
+        # :meth:`_init_mpp` for why), so each frame interval is
+        # ``_pts_tick_stride`` (= 90000 // fps) ticks — frame N gets
+        # PTS = N × stride, DTS = N × stride, duration = stride. The
+        # stream's ``time_base`` is reused on the packet so PyAV's
+        # ``packet._rebase_time`` is a no-op for the common
+        # non-B-frame path (pts == dts, no reordering).
+        stride = self._pts_tick_stride
+        packet.pts = self._pts * stride
+        packet.dts = self._pts * stride
+        packet.duration = stride
         packet.time_base = self._stream.time_base
         packet.stream = self._stream
         self._container.mux(packet)
