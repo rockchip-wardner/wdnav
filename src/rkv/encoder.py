@@ -395,6 +395,17 @@ class VideoWriter:
         self._path = path
         self._fps = fps
         self._width, self._height = frame_size
+        # ``_hor_stride`` / ``_ver_stride`` mirror the per-row padding the
+        # source frames carry (e.g. the MPP HEVC decoder reports
+        # hor_stride=768 for 720-wide frames). ``0`` means "no padding,
+        # stride = width / height" — the default for ``frame_size=(W, H)``
+        # construction. :meth:`_init_from_frame` overwrites these from the
+        # first :class:`DecodedFrame` it sees on the lazy-init path so the
+        # MPP encoder's ``prep:hor_stride`` matches the decoder's actual
+        # buffer layout. See ``mpp.MppEncoder`` and ``cshim_video_encoder.c``
+        # for the wiring.
+        self._hor_stride: int = 0
+        self._ver_stride: int = 0
         # ``_pending_init`` is True when the caller didn't pass a
         # positive ``frame_size`` — the encoder backend (MPP / PyAV)
         # and the output container are created lazily on the first
@@ -520,7 +531,14 @@ class VideoWriter:
         without a positive ``frame_size``. Pulls ``width`` /
         ``height`` from a :class:`rkv.mpp.DecodedFrame` or, for a
         BGR ndarray, derives them from ``frame.shape`` (``(W, H) =
-        (frame.shape[1], frame.shape[0])``). Stores the resolved
+        (frame.shape[1], frame.shape[0])``). For a :class:`DecodedFrame`
+        the per-row padding (``hor_stride`` / ``ver_stride``) is also
+        captured so the MPP encoder's ``prep:hor_stride`` matches the
+        decoder's actual buffer layout — without this the encoder
+        reads each row at the wrong offset and the output is mis-
+        aligned (notably visible on HEVC sources where
+        ``hor_stride`` ≠ ``width``). Numpy inputs always have tight
+        strides equal to ``width`` / ``height``. Stores the resolved
         size on ``self`` and routes through the same backend setup
         paths as the eager-init branches above.
 
@@ -531,6 +549,11 @@ class VideoWriter:
         """
         if hasattr(frame, "fd"):
             w, h = int(frame.width), int(frame.height)
+            # Decoder may pad each row past ``width``; honour it so the
+            # encoder's prep config matches the buffer layout. Zero /
+            # missing fields fall back to the natural tight stride.
+            hs = int(getattr(frame, "hor_stride", 0) or 0)
+            vs = int(getattr(frame, "ver_stride", 0) or 0)
         else:
             try:
                 h, w = int(frame.shape[0]), int(frame.shape[1])
@@ -540,12 +563,16 @@ class VideoWriter:
                     f"{type(frame).__name__}; pass frame_size=(W, H) "
                     f"to VideoWriter().__init__"
                 ) from e
+            hs = 0
+            vs = 0
         if w <= 0 or h <= 0:
             raise ValueError(
                 f"first frame has non-positive size ({w}, {h}); "
                 f"pass frame_size=(W, H) to VideoWriter().__init__"
             )
         self._width, self._height = w, h
+        self._hor_stride = hs
+        self._ver_stride = vs
 
         path = self._path
         codec = self._codec
@@ -691,6 +718,8 @@ class VideoWriter:
         self._encoder = MppEncoder(
             width=self._width,
             height=self._height,
+            hor_stride=self._hor_stride,
+            ver_stride=self._ver_stride,
             fps=self._fps,
             bitrate=self._bitrate,
             gop=self._gop,
@@ -845,6 +874,8 @@ class VideoWriter:
             MppCodingType.MJPEG,
             width=self._width,
             height=self._height,
+            hor_stride=self._hor_stride,
+            ver_stride=self._ver_stride,
             fps=self._fps,
             gop=self._gop,
             input_format=self._mpp_mjpeg_input_format,
@@ -874,6 +905,8 @@ class VideoWriter:
             coding_type=coding,
             width=self._width,
             height=self._height,
+            hor_stride=self._hor_stride,
+            ver_stride=self._ver_stride,
             fps=self._fps,
             bitrate=self._bitrate,
             gop=self._gop,
@@ -892,6 +925,8 @@ class VideoWriter:
             coding_type=MppCodingType.MJPEG,
             width=self._width,
             height=self._height,
+            hor_stride=self._hor_stride,
+            ver_stride=self._ver_stride,
             fps=max(self._fps, 1),
             gop=self._gop,
             input_format=MppFrameFormat.BGR888,
@@ -929,6 +964,8 @@ class VideoWriter:
             self._encoder = MppEncoder(
                 width=self._width,
                 height=self._height,
+                hor_stride=self._hor_stride,
+                ver_stride=self._ver_stride,
                 fps=self._fps,
                 bitrate=self._bitrate,
                 gop=self._gop,

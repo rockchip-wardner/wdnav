@@ -280,13 +280,14 @@ class _RkvDecFrame(Structure):
 # ---------------------------------------------------------------------------
 
 # rkv_enc_create(int coding_type, int width, int height,
+#                int hor_stride, int ver_stride,
 #                int fps, int bitrate, int gop,
 #                int profile, int rc_mode, int input_format, int q_factor,
 #                char *err_buf, int err_buf_len,
 #                rkv_encoder_t **out_enc);
 _lib.rkv_enc_create.argtypes = [
-    c_int, c_int, c_int, c_int, c_int, c_int,
-    c_int, c_int, c_int, c_int,
+    c_int, c_int, c_int, c_int, c_int, c_int, c_int,
+    c_int, c_int, c_int, c_int, c_int,
     c_char_p, c_int, POINTER(c_void_p),
 ]
 _lib.rkv_enc_create.restype = c_int
@@ -610,6 +611,8 @@ class MppEncoder:
         *,
         width: int,
         height: int,
+        hor_stride: int = 0,
+        ver_stride: int = 0,
         fps: int = 30,
         bitrate: int = 2_000_000,
         gop: int = 30,
@@ -653,6 +656,17 @@ class MppEncoder:
         self._coding = coding_type
         self._width = int(width)
         self._height = int(height)
+        # Decoder output buffers frequently pad each row past ``width``
+        # (e.g. HEVC on RK3588 reports 720x1280 frames with
+        # hor_stride=768). The encoder's ``prep:hor_stride`` is locked
+        # at init, so we forward the actual strides here. ``0`` means
+        # "no padding", which falls back to ``width`` / ``height`` in
+        # the shim. The eager-BGR :meth:`encode` path requires
+        # ``hor_stride == width`` (numpy arrays are contiguous);
+        # callers that need a non-zero padding must use the zero-copy
+        # :meth:`encode_external_fd` path exclusively.
+        self._hor_stride = int(hor_stride) if hor_stride > 0 else 0
+        self._ver_stride = int(ver_stride) if ver_stride > 0 else 0
         self._fps = int(fps)
         self._bitrate = int(bitrate)
         self._gop = int(gop)
@@ -688,7 +702,9 @@ class MppEncoder:
         handle = c_void_p()
         with _mpp_lock:
             ret = _lib.rkv_enc_create(
-                int(coding_type), int(width), int(height), int(fps),
+                int(coding_type), int(width), int(height),
+                self._hor_stride, self._ver_stride,
+                int(fps),
                 int(bitrate), int(gop),
                 int(profile_idc), int(rc_mode_id),
                 self._shim_input_format, int(q_factor),
@@ -714,6 +730,14 @@ class MppEncoder:
     def width(self) -> int: return self._width
     @property
     def height(self) -> int: return self._height
+    @property
+    def hor_stride(self) -> int:
+        """Configured ``prep:hor_stride`` (``0`` ⇒ same as ``width``)."""
+        return self._hor_stride or self._width
+    @property
+    def ver_stride(self) -> int:
+        """Configured ``prep:ver_stride`` (``0`` ⇒ same as ``height``)."""
+        return self._ver_stride or self._height
     @property
     def fps(self) -> int: return self._fps
     @property

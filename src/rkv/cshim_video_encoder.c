@@ -385,6 +385,7 @@ static MPP_RET fetch_extradata(rkv_encoder_t *enc,
 
 int rkv_enc_create(
     int coding_type, int width, int height,
+    int hor_stride, int ver_stride,
     int fps, int bitrate, int gop,
     int profile, int rc_mode, int input_format, int q_factor,
     char *err_buf, int err_buf_len,
@@ -417,8 +418,15 @@ int rkv_enc_create(
     enc->coding_type   = coding_type;
     enc->width         = width;
     enc->height        = height;
-    enc->hor_stride    = width;   /* default: no padding; can be overridden by caller via put_frame */
-    enc->ver_stride    = height;
+    /* Decoder output buffers frequently pad each row up to an
+     * alignment boundary (e.g. HEVC on RK3588 reports 720x1280 frames
+     * with hor_stride=768). Without honouring those strides here the
+     * encoder's ``prep:hor_stride`` is locked to ``width`` and the
+     * HAL reads each row at the wrong offset — visible as a striped /
+     * diagonal skew in the encoded output. ``hor_stride=0`` /
+     * ``ver_stride=0`` mean "no padding, stride == dimension". */
+    enc->hor_stride    = (hor_stride > 0) ? hor_stride : width;
+    enc->ver_stride    = (ver_stride > 0) ? ver_stride : height;
     enc->fps           = fps;
     enc->bitrate       = bitrate;
     enc->gop           = gop;
