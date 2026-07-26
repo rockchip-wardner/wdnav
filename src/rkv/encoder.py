@@ -1055,14 +1055,29 @@ class VideoWriter:
             self._init_from_frame(frame)
             self._pending_init = False
 
+        # When the caller's frame geometry doesn't match the encoder's
+        # configured size, scale via RGA before forwarding to the
+        # encoder. Covers both BGR ndarray and zero-copy
+        # ``DecodedFrame`` inputs — ``rkv.rga.resize_bgr`` handles
+        # both in one RGA pass. Auto-scaling replaces ``frame`` with a
+        # fresh BGR ndarray, so the zero-copy path below is skipped
+        # (``encode_external_fd`` cannot change geometry). When sizes
+        # already match the input is returned untouched, preserving the
+        # zero-copy fast path for DecodedFrame + H.264/HEVC.
+        is_decoded_frame = hasattr(frame, "fd")
+        in_w = int(getattr(frame, "width", frame.shape[1])) if is_decoded_frame else int(frame.shape[1])
+        in_h = int(getattr(frame, "height", frame.shape[0])) if is_decoded_frame else int(frame.shape[0])
+        if self._width > 0 and self._height > 0 and (in_w != self._width or in_h != self._height):
+            from . import rga
+            frame = rga.resize_bgr(frame, self._width, self._height)
+            is_decoded_frame = False
+
         if self._ws_sink is not None:
             if self._backend == "ws-h264-mpp":
                 self._send_ws_h264(frame)
             else:
                 self._send_ws_jpeg(frame)
             return
-
-        is_decoded_frame = hasattr(frame, "fd")
 
         # Zero-copy path: input is a DecodedFrame (DMA-BUF fd),
         # encoder backend is the MPP H.264 path. We import the

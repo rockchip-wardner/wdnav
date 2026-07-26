@@ -840,6 +840,77 @@ def resize(
     _check(ret, "imresize")
 
 
+def resize_bgr(
+    frame,
+    out_w: int,
+    out_h: int,
+    *,
+    interpolation: int = INTER_LINEAR,
+) -> "np.ndarray":
+    """Resize a BGR ndarray (or zero-copy :class:`DecodedFrame`) to
+    ``(out_h, out_w, 3)`` on RGA, returning a contiguous BGR
+    ``np.ndarray`` view.
+
+    Accepts:
+
+    * ``np.ndarray`` of shape ``(H, W, 3)`` ``uint8`` — BGR layout
+      (OpenCV convention). The buffer is registered in-place via
+      :func:`wrap_virtual`; the caller may keep using it after this
+      call returns because RGA's wrap is by reference.
+    * ``rkv.mpp.DecodedFrame`` (or any object exposing ``width``,
+      ``height``, ``fd``, ``ptr``, ``fmt``, ``hor_stride``,
+      ``ver_stride``) — the zero-copy DMA-BUF frame. Uses
+      :meth:`DecodedFrame.numpy` internally with ``fmt="BGR"`` so the
+      format conversion + resize happen in a single RGA pass.
+
+    Returns a fresh ``(out_h, out_w, 3)`` ``uint8`` ndarray backed by
+    RGA-managed storage. If ``(H, W)`` already matches
+    ``(out_h, out_w)`` the input ndarray is returned as-is; for
+    ``DecodedFrame`` the convenience path is still taken so the
+    output is always a BGR ndarray (not whatever YUV format the
+    decoder happened to emit).
+
+    All work runs on the RGA hardware core — there is no
+    ``cv2.resize`` / numpy fallback path, in line with the project's
+    "no software scaling" rule.
+    """
+    import ctypes
+
+    import numpy as np
+
+    from .mpp import MppFrameFormat
+
+    if hasattr(frame, "fd") and hasattr(frame, "numpy"):
+        # Zero-copy path: DecodedFrame (DMA-BUF fd or VA). Defer to
+        # DecodedFrame.numpy() which already does format-convert +
+        # resize in a single RGA pass and handles stride correctly.
+        return frame.numpy(w=out_w, h=out_h, fmt="BGR")
+
+    if not isinstance(frame, np.ndarray):
+        raise TypeError(
+            "resize_bgr expects a BGR np.ndarray or a DecodedFrame, "
+            f"got {type(frame).__name__}"
+        )
+    if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError(
+            f"resize_bgr expects a uint8 HxWx3 BGR ndarray, got "
+            f"shape={frame.shape} dtype={frame.dtype.name}"
+        )
+
+    src_h, src_w = frame.shape[:2]
+    if (src_h, src_w) == (out_h, out_w):
+        return frame
+
+    src_buf = wrap_virtual(frame.ctypes.data, src_w, src_h, RgaFormat.BGR_888)
+    dst_storage = (ctypes.c_uint8 * (out_h * out_w * 3))()
+    dst_buf = wrap_virtual(
+        ctypes.addressof(dst_storage), out_w, out_h, RgaFormat.BGR_888,
+    )
+    resize(src_buf, dst_buf, interpolation=interpolation, sync=True)
+    flush()
+    return np.frombuffer(dst_storage, dtype=np.uint8).reshape(out_h, out_w, 3)
+
+
 def copy(src: rga_buffer_t, dst: rga_buffer_t, sync: bool = True) -> None:
     """Raw RGA copy — same-format hardware DMA."""
     with _rga_lock:
@@ -968,6 +1039,7 @@ __all__ = [
     "import_nv12_fd",
     "cvtcolor",
     "resize",
+    "resize_bgr",
     "copy",
     "flush",
     "wrap_virtual",
