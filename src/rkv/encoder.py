@@ -1213,12 +1213,20 @@ class VideoWriter:
                 self._ws_sink.close()
                 self._ws_sink = None
             if self._stream is not None and self._container is not None:
-                # Flush any packets the encoder is still holding.
-                try:
-                    for pkt in self._stream.encode():
-                        self._container.mux(pkt)
-                except Exception:
-                    pass
+                # Flush any packets the encoder is still holding. Only
+                # streams created with ``add_stream(...)`` have a
+                # ``CodecContext``; H.264 container paths use
+                # ``add_mux_stream`` (mux-only, ``codec_context is
+                # None``) so calling ``stream.encode()`` here segfaults
+                # on a NULL dereference — and there's nothing to flush
+                # anyway because every NAL was already muxer'd inside
+                # ``_send_mpp_packet`` during ``write()``.
+                if getattr(self._stream, "codec_context", None) is not None:
+                    try:
+                        for pkt in self._stream.encode():
+                            self._container.mux(pkt)
+                    except Exception:
+                        pass
             if self._container is not None:
                 try:
                     self._container.close()
