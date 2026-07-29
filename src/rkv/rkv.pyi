@@ -36,6 +36,13 @@ class DecodedFrame:
         h: Optional[int] = ...,
         fmt: Optional[str] = ...,
     ) -> np.ndarray: ...
+    def crop(
+        self,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+    ) -> "DecodedFrame": ...
 
 
 class EncodedPacket:

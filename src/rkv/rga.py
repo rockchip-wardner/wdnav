@@ -450,6 +450,10 @@ _lib.imresize_t.argtypes = [
 ]
 _lib.imresize_t.restype = c_int
 
+# imcrop_t(src, dst, rect, sync) -> IM_STATUS — same-format hardware crop.
+_lib.imcrop_t.argtypes = [rga_buffer_t, rga_buffer_t, im_rect, c_int]
+_lib.imcrop_t.restype = c_int
+
 # ---- imcheck / querystring / imStrError (im2d_common.h) ----
 # imcheck_t(src, dst, pat, src_rect, dst_rect, pat_rect, mode_usage) -> IM_STATUS
 _lib.imcheck_t.argtypes = [
@@ -840,6 +844,24 @@ def resize(
     _check(ret, "imresize")
 
 
+def imcrop(
+    src: rga_buffer_t,
+    dst: rga_buffer_t,
+    rect: im_rect,
+    sync: bool = True,
+) -> None:
+    """RGA hardware crop — copy the ``rect`` region of ``src`` into ``dst``.
+
+    ``src`` and ``dst`` must share the same pixel format (use :func:`cvtcolor`
+    for a separate format-convert pass if needed). ``dst``'s geometry drives
+    the output: a ``(crop_w, crop_h)`` ``im_rect`` plus a ``(crop_w, crop_h)``
+    destination buffer yields a 1:1 crop with no scaling.
+    """
+    with _rga_lock:
+        ret = _lib.imcrop_t(src, dst, rect, IM_SYNC if sync else 0)
+    _check(ret, "imcrop")
+
+
 def resize_bgr(
     frame,
     out_w: int,
@@ -1040,6 +1062,7 @@ __all__ = [
     "cvtcolor",
     "resize",
     "resize_bgr",
+    "imcrop",
     "copy",
     "flush",
     "wrap_virtual",

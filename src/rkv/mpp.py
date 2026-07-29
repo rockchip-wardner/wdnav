@@ -489,6 +489,7 @@ class DecodedFrame:
     fd: int            # DMA-BUF fd; -1 if not available
     buf_size: int
     raw: "MppFrame._RawRef" = None  # opaque handle held by the decoder
+    _dmabuf: "DmaBuf | None" = None  # owned DMA-BUF (set by crop())
 
     out_w: Optional[int] = None
     out_h: Optional[int] = None
@@ -549,6 +550,115 @@ class DecodedFrame:
         if rga_w != target_w:
             out = out[:, :target_w]
         return out
+
+    def crop(
+        self,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+    ) -> "DecodedFrame":
+        """Crop this frame via RGA in normalised [0, 1] coordinates.
+
+        Returns a new :class:`DecodedFrame` holding a freshly allocated
+        DMA-BUF (``fd >= 0``) that owns the cropped pixel data, so it can
+        be handed straight to :meth:`rkv.encoder.VideoWriter.write` for
+        zero-copy ``encode_external_fd``, or chained with
+        :meth:`numpy` (``fmt="BGR"``) for an ndarray. The source pixel
+        format is preserved — for colour conversion chain ``.crop(...)``
+        with :meth:`numpy`.
+
+        Parameters
+        ----------
+        x, y, w, h:
+            Normalised top-left and size, all in ``[0, 1]``. ``w`` and
+            ``h`` must be strictly positive. The pixel-space region is
+            computed as ``round(coord * dimension)`` and then clamped so
+            it never exceeds the source frame.
+        """
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0
+                and 0.0 <= w <= 1.0 and 0.0 <= h <= 1.0):
+            raise ValueError(
+                f"x, y, w, h must be in [0, 1], got ({x}, {y}, {w}, {h})"
+            )
+        if w == 0.0 or h == 0.0:
+            raise ValueError("w and h must be > 0")
+
+        # Deferred import so mpp.py stays import-safe on dev boxes that
+        # lack /dev/dma_heap (only clip() actually needs the allocator).
+        from .dmaheap import DmaHeap
+
+        src_w, src_h = self.width, self.height
+        crop_x = int(round(x * src_w))
+        crop_y = int(round(y * src_h))
+        crop_w = min(int(round(w * src_w)), src_w - crop_x)
+        crop_h = min(int(round(h * src_h)), src_h - crop_y)
+        if crop_w <= 0 or crop_h <= 0:
+            raise ValueError("clip region is empty after rounding")
+
+        from . import rga
+
+        input_fmt = _rga_input_format(self.fmt)
+        hor_stride = self.hor_stride or self.width
+        ver_stride = self.ver_stride or self.height
+        if self.fd is not None and self.fd >= 0:
+            src = rga.wrap_fd(
+                self.fd, src_w, src_h, input_fmt,
+                wstride=hor_stride, hstride=ver_stride,
+            )
+        else:
+            src = rga.wrap_virtual(
+                self.ptr, src_w, src_h, input_fmt,
+                wstride=hor_stride, hstride=ver_stride,
+            )
+
+        rga_w = (crop_w + 15) & ~15
+        # MPP output formats (NV12/NV21/I420) all share the 1.5 bpp
+        # semi-planar / planar layout; ceil-div to bytes is crop_w*crop_h*3/2.
+        alloc_size = rga_w * crop_h * 3 // 2
+
+        heap = DmaHeap()
+        try:
+            dmabuf = heap.alloc(alloc_size)
+        finally:
+            heap.close()
+
+        dst = rga.wrap_fd(
+            dmabuf.fd, rga_w, crop_h, input_fmt,
+            wstride=rga_w, hstride=crop_h,
+        )
+        rect = rga.im_rect(crop_x, crop_y, crop_w, crop_h)
+        try:
+            rga.imcrop(src, dst, rect)
+            rga.flush()
+        except RuntimeError as e:
+            dmabuf.close()
+            raise RuntimeError(
+                f"RGA crop failed: src {_MPP_TO_RGA_NAME.get(self.fmt, self.fmt)} "
+                f"{src_w}x{src_h} -> {crop_w}x{crop_h} @ ({crop_x}, {crop_y}): {e}"
+            ) from e
+
+        new = DecodedFrame(
+            width=crop_w,
+            height=crop_h,
+            hor_stride=rga_w,
+            ver_stride=crop_h,
+            fmt=self.fmt,
+            pts=self.pts,
+            ptr=0,
+            fd=dmabuf.fd,
+            buf_size=alloc_size,
+            raw=None,
+            out_w=None,
+            out_h=None,
+            out_fmt=None,
+        )
+        # Hold dmabuf alive on the new frame so the fd stays valid for
+        # the lifetime of the returned DecodedFrame. dataclass doesn't
+        # declare this attribute, so use object.__setattr__ to bypass
+        # the field machinery.
+        object.__setattr__(new, "_dmabuf", dmabuf)
+        return new
 
 
 # Packet flag bit 4 marks intra / key frames per cshim_video_encoder.c.
