@@ -18,13 +18,13 @@ what this module does:
   dataclasses returned by the inspection API.
 
 Once the pipeline is configured, hand the resulting capture node
-(``/dev/videoX``) to :class:`rkv.video.VideoCapture` to actually pull
+(``/dev/videoX``) to :class:`wdnav.video.VideoCapture` to actually pull
 frames.
 
 Typical usage on a Rockchip board::
 
-    import rkv
-    from rkv.media import MediaDevice
+    import wdnav
+    from wdnav.media import MediaDevice
 
     dev = MediaDevice("/dev/media0")
     for ent in dev.entities():
@@ -36,7 +36,7 @@ Typical usage on a Rockchip board::
     # Set ISP pad format.
     dev.setup_format("rockchip-csi2-dphy0":1, fmt="SRGGB10", width=1920, height=1080)
 
-    cap = rkv.VideoCapture(dev.entities()[0].device_path)
+    cap = wdnav.VideoCapture(dev.entities()[0].device_path)
 """
 
 from __future__ import annotations

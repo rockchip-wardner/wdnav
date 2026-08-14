@@ -1,4 +1,4 @@
-"""Minimal smoke test for rkv.VideoCapture.
+"""Minimal smoke test for wdnav.VideoCapture.
 
 Run with the system Python (which has apt-installed python3-av):
 
@@ -18,12 +18,12 @@ import sys
 
 import cv2
 
-from rkv import VideoCapture
+from wdnav import VideoCapture
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=("Open a local file or a network stream with rkv.VideoCapture and display / count decoded frames."),
+        description=("Open a local file or a network stream with wdnav.VideoCapture and display / count decoded frames."),
     )
     parser.add_argument(
         "path",

@@ -25,7 +25,7 @@ import sys
 
 import cv2
 
-from rkv import MediaDevice, VideoCapture
+from wdnav import MediaDevice, VideoCapture
 
 
 def print_topology(dev: MediaDevice) -> None:

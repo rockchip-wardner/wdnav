@@ -16,7 +16,7 @@ Usage::
     python samples/video_capture_writer.py bus.mp4 /tmp/out.mp4 --read0
 
 Pass ``--read0`` to use :meth:`VideoCapture.read0` — the zero-copy
-read path that returns a :class:`rkv.mpp.DecodedFrame` whose ``fd`` is
+read path that returns a :class:`wdnav.mpp.DecodedFrame` whose ``fd`` is
 the MPP-decoded DMA-BUF. The frame is then handed straight to
 :meth:`VideoWriter.write` via the same ``frame0`` shape the public API
 expects; ``VideoWriter.write`` keeps the zero-copy semantics by
@@ -39,7 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
-from rkv import VideoCapture, VideoWriter
+from wdnav import VideoCapture, VideoWriter
 
 
 def _synthetic_frame(i: int, w: int, h: int) -> np.ndarray:
@@ -61,8 +61,8 @@ def _synthetic_frame(i: int, w: int, h: int) -> np.ndarray:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Decode frames with rkv.VideoCapture and re-encode them "
-            "with rkv.VideoWriter. Verifies the capture → writer "
+            "Decode frames with wdnav.VideoCapture and re-encode them "
+            "with wdnav.VideoWriter. Verifies the capture → writer "
             "pipeline works end-to-end."
         ),
     )

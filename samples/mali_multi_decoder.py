@@ -1,8 +1,8 @@
-"""2x2 hardware decode + GPU composition via rkv.SurfaceFlinger.
+"""2x2 hardware decode + GPU composition via wdnav.SurfaceFlinger.
 
 Four input files, each on its own decode thread + its own
-:class:`rkv.VideoCapture` + its own :class:`rkv.Surface` on a 2x2 grid in
-a single :class:`rkv.SurfaceFlinger`. The main thread just calls
+:class:`wdnav.VideoCapture` + its own :class:`wdnav.Surface` on a 2x2 grid in
+a single :class:`wdnav.SurfaceFlinger`. The main thread just calls
 ``sf.read()`` once per loop iteration; the per-frame composition is GPU.
 
 Same per-stream pacing as :file:`multi_decoder.py`, but the grid layer
@@ -30,7 +30,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-import rkv
+import wdnav
 
 
 _NUM_STREAMS = 4
@@ -43,14 +43,14 @@ class Stream:
         self,
         path: str,
         slot: int,
-        surface: "rkv.Surface",
+        surface: "wdnav.Surface",
         cell_size: Tuple[int, int],
     ) -> None:
         self.path = path
         self.slot = slot
         self.surface = surface
         self.cell_w, self.cell_h = cell_size
-        self.cap: Optional[rkv.VideoCapture] = None
+        self.cap: Optional[wdnav.VideoCapture] = None
         self.eof = False
         self.frames = 0
         self.t0 = time.monotonic()
@@ -58,7 +58,7 @@ class Stream:
 
     def open(self) -> None:
         try:
-            self.cap = rkv.VideoCapture(self.path, timeout=10.0)
+            self.cap = wdnav.VideoCapture(self.path, timeout=10.0)
         except (FileNotFoundError, RuntimeError) as e:
             self.error = f"open failed: {e}"
             self.eof = True
@@ -130,7 +130,7 @@ def main(args: argparse.Namespace) -> int:
         return 1
     cell_w, cell_h = grid_w // 2, grid_h // 2
 
-    sf = rkv.SurfaceFlinger(w=grid_w, h=grid_h)
+    sf = wdnav.SurfaceFlinger(w=grid_w, h=grid_h)
     surfaces = [
         sf.create_surface(
             (i % 2) * cell_w, (i // 2) * cell_h,
@@ -153,14 +153,14 @@ def main(args: argparse.Namespace) -> int:
     for t in threads:
         t.start()
 
-    cv2.namedWindow("rkv multi-decoder", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("rkv multi-decoder", grid_w, grid_h)
+    cv2.namedWindow("wdnav multi-decoder", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("wdnav multi-decoder", grid_w, grid_h)
 
     last_stats = time.monotonic()
     try:
         while True:
             img = sf.read(timeout=5.0)
-            cv2.imshow("rkv multi-decoder", img)
+            cv2.imshow("wdnav multi-decoder", img)
             if cv2.waitKey(30) & 0xFF == ord("q"):
                 break
 
@@ -200,7 +200,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Decode 4 video files in parallel and composite them on the GPU "
-            "via rkv.SurfaceFlinger."
+            "via wdnav.SurfaceFlinger."
         ),
     )
     p.add_argument(

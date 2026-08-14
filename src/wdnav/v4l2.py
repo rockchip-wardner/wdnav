@@ -20,7 +20,7 @@ We extend the package's coverage in two ways the upstream doesn't:
 
 Typical usage::
 
-    from rkv.v4l2 import V4L2Capture
+    from wdnav.v4l2 import V4L2Capture
 
     cap = V4L2Capture("/dev/video11", width=1920, height=1080,
                        pixel_format="nv12", num_buffers=4)
@@ -271,7 +271,7 @@ class V4L2BufferInfo:
     ``plane_fds`` is the matching tuple of **DMA-BUF file descriptors** — one
     per plane. These are exported once during :class:`V4L2Capture` setup
     (via ``VIDIOC_EXPBUF``) and reused for every DQBUF on the same buffer
-    index. Hand them to ``rkv.rga.wrap_fd`` / ``wrap_nv12_fd`` for hardware
+    index. Hand them to ``wdnav.rga.wrap_fd`` / ``wrap_nv12_fd`` for hardware
     color conversion / resize without going through CPU cache.
 
     Single-planar buffers always have a single-element ``plane_fds`` tuple.

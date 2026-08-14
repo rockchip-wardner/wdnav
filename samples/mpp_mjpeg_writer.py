@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Smoke sample for ``rkv.VideoWriter`` with ``codec="mjpeg"``.
+"""Smoke sample for ``wdnav.VideoWriter`` with ``codec="mjpeg"``.
 
 Drives the MPP hardware MJPEG encoder (the ``mpp-mjpeg`` backend
-of :class:`rkv.VideoWriter`) end-to-end: synthesises a moving colour-bar
+of :class:`wdnav.VideoWriter`) end-to-end: synthesises a moving colour-bar
 frame on the CPU, hands it to the encoder, and lets PyAV mux the
 resulting JPEG packets into an AVI container.
 
@@ -71,7 +71,7 @@ import time
 
 import numpy as np
 
-from rkv import VideoWriter
+from wdnav import VideoWriter
 
 
 def synthetic_frame(i: int, w: int = 640, h: int = 360) -> np.ndarray:

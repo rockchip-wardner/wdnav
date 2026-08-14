@@ -1,7 +1,7 @@
 """ctypes wrapper for the Mali GLES driver (``libmali.so``).
 
 This module exposes the subset of EGL / GLES / DRM-fourcc functions needed
-by :mod:`rkv.surfaceflinger` to run an offscreen GL compositor on Rockchip:
+by :mod:`wdnav.surfaceflinger` to run an offscreen GL compositor on Rockchip:
 
 * ``EGLDisplay`` / ``EGLContext`` lifecycle on a surfaceless ES 3.x context.
 * ``EGL_EXT_image_dma_buf_import`` to wrap a producer-side DMA-BUF fd as a
@@ -13,12 +13,12 @@ by :mod:`rkv.surfaceflinger` to run an offscreen GL compositor on Rockchip:
 
 The library is **not** bundled with this package. It must be installed
 system-wide; if neither ``/usr/lib/aarch64-linux-gnu/libmali.so`` nor an
-ldconfig-registered ``mali`` resolves, the import of :mod:`rkv`
-``SurfaceFlinger`` falls back to ``None`` (see :mod:`rkv.__init__`).
+ldconfig-registered ``mali`` resolves, the import of :mod:`wdnav`
+``SurfaceFlinger`` falls back to ``None`` (see :mod:`wdnav.__init__`).
 
 Typical use (offscreen composition):
 
-    import rkv.mali as mali
+    import wdnav.mali as mali
     dpy = mali.get_default_display()
     mali.initialize(dpy)
     ctx = mali.create_context(dpy, cfg, client_version=3)
@@ -81,7 +81,7 @@ _mali_lock = threading.RLock()
 class DRMFormat:
     """DRM fourcc pixel format codes used by ``EGL_EXT_image_dma_buf_import``.
 
-    Values match ``drm_fourcc.h`` on aarch64 Linux. Only the formats rkv's
+    Values match ``drm_fourcc.h`` on aarch64 Linux. Only the formats wdnav's
     compositor actually consumes are listed.
     """
 
@@ -416,7 +416,7 @@ def create_context(
     client_version: int = 3,
 ) -> c_void_p:
     """Create an ES 3.x context. ``share_ctx`` lets multiple contexts
-    share textures/programs (not currently used by rkv)."""
+    share textures/programs (not currently used by wdnav)."""
     attribs = (ctypes.c_int * 5)(
         EGL_CONTEXT_CLIENT_VERSION, client_version,
         EGL_NONE, EGL_NONE, 0,

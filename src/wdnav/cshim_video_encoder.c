@@ -2,7 +2,7 @@
  *
  * Replaces the previous "expose every mpp_* symbol" pattern from
  * cshim_video.c with a small, opinionated surface that mirrors what
- * rkv's Python layer actually does:
+ * wdnav's Python layer actually does:
  *
  *     rkv_enc_create()  — bring up an MPP encoder context with all
  *                         the kcfg keys / RC API / header mode that
@@ -34,7 +34,7 @@
  * this file into libshim_video.so alongside the decoder shim.
  *
  * Thread safety: not thread-safe. Callers serialise access externally
- * (rkv's mpp.py holds a single Python-level lock around every MPP
+ * (wdnav's mpp.py holds a single Python-level lock around every MPP
  * call). The shim itself doesn't grab any locks.
  */
 
@@ -109,11 +109,11 @@
 /* Module / function tag strings for MPP's buffer-group debug logs.
  * These are plain (char *) — MPP's tag slots take ``const char *``,
  * and the byte-string ``b"..."`` syntax is C++-only. */
-#define RKV_TAG_MODULE "rkv-shim"
-#define RKV_TAG_FRM    "rkv-enc-frm"
-#define RKV_TAG_PKT    "rkv-enc-pkt"
-#define RKV_TAG_META   "rkv-enc-mjpeg"
-#define RKV_TAG_EXT    "rkv-enc-ext"
+#define RKV_TAG_MODULE "wdnav-shim"
+#define RKV_TAG_FRM    "wdnav-enc-frm"
+#define RKV_TAG_PKT    "wdnav-enc-pkt"
+#define RKV_TAG_META   "wdnav-enc-mjpeg"
+#define RKV_TAG_EXT    "wdnav-enc-ext"
 
 struct rkv_encoder {
     MppCtx       ctx;
@@ -155,7 +155,7 @@ typedef struct rkv_encoder rkv_encoder_t;
  * on init failure without us having to reorganise the file. */
 void rkv_enc_destroy(rkv_encoder_t *enc);
 
-/* Public struct returned to Python — must match rkv.cshim_video._encoder's
+/* Public struct returned to Python — must match wdnav.cshim_video._encoder's
  * packet ctype. Layout fields are plain integers so ctypes.Structure
  * reads them correctly. */
 typedef struct rkv_enc_packet {

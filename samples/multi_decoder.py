@@ -1,7 +1,7 @@
 """4-way H.264 / H.265 hardware decode with 2x2 (田-grid) display.
 
 Each of the four input files gets its own decode thread and its own
-``rkv.VideoCapture`` (so its own ``MppDecoder`` and VPU core). The
+``wdnav.VideoCapture`` (so its own ``MppDecoder`` and VPU core). The
 main thread composites the latest frame from each stream into a
 single 2x2 image and shows it via ``cv2.imshow`` (or prints a stats
 line when cv2 is unavailable).
@@ -33,7 +33,7 @@ Press ``q`` in the display window to stop. The decode threads are
 daemons and exit when their source EOFs (or the main thread tears
 the window down).
 
-Note on concurrency: ``rkv.mpp`` guards every C call with a process-
+Note on concurrency: ``wdnav.mpp`` guards every C call with a process-
 wide ``_mpp_lock``, so the four Python threads serialise through
 that lock at the FFI boundary. The VPU cores themselves can run
 parallel decode, but the Python wrapper exposes a single safe
@@ -53,7 +53,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from rkv import VideoCapture
+from wdnav import VideoCapture
 
 
 # Number of streams in the grid. Locked to 4 because the sample is
@@ -210,8 +210,8 @@ def main(args: argparse.Namespace) -> int:
     for t in threads:
         t.start()
 
-    cv2.namedWindow("rkv multi-decoder", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("rkv multi-decoder", grid_w, grid_h)
+    cv2.namedWindow("wdnav multi-decoder", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("wdnav multi-decoder", grid_w, grid_h)
 
     grid = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
     last_stats = time.monotonic()
@@ -222,7 +222,7 @@ def main(args: argparse.Namespace) -> int:
                 x, y = _slot_xy(s.slot, cell_w, cell_h)
                 grid[y : y + cell_h, x : x + cell_w] = cell
 
-            cv2.imshow("rkv multi-decoder", grid)
+            cv2.imshow("wdnav multi-decoder", grid)
             key = cv2.waitKey(30) & 0xFF
             if key == ord("q"):
                 break

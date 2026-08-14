@@ -1,4 +1,4 @@
-"""Pure-GL smoke test for rkv.SurfaceFlinger.
+"""Pure-GL smoke test for wdnav.SurfaceFlinger.
 
 Verifies the surfaceless EGL context + FBO + PBO + shader path end-to-end
 without involving VideoCapture. Useful for debugging compositor issues in
@@ -7,8 +7,8 @@ isolation from the decoder.
     python samples/mali_surfaceless_smoke.py [out.png]
 
 Writes a 640x480 PNG of a synthetic gradient composited through a single
-BGR888 Surface. Also exercises ``rkv.DmaHeap`` to allocate a DMA-BUF
-fd and shows how to wrap it with ``rkv.mali.create_image_dma_buf``;
+BGR888 Surface. Also exercises ``wdnav.DmaHeap`` to allocate a DMA-BUF
+fd and shows how to wrap it with ``wdnav.mali.create_image_dma_buf``;
 the actual compositing stays on the BGR surface because that path is
 guaranteed to work regardless of whether libmali accepts general
 DMA-BUF fds.
@@ -20,25 +20,25 @@ import sys
 import cv2
 import numpy as np
 
-import rkv
+import wdnav
 
 
 def main() -> int:
     out_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/rkv_surfaceless_smoke.png"
-    if rkv.SurfaceFlinger is None:
+    if wdnav.SurfaceFlinger is None:
         print("libmali not loadable; SurfaceFlinger is None", file=sys.stderr)
         return 1
 
-    if rkv.DmaHeap is not None:
-        print(f"available dma-heaps: {rkv.list_heaps()}")
-        heap = rkv.DmaHeap("system")
+    if wdnav.DmaHeap is not None:
+        print(f"available dma-heaps: {wdnav.list_heaps()}")
+        heap = wdnav.DmaHeap("system")
         buf = heap.alloc(640 * 480 * 3 // 2)  # NV12-sized buffer
         print(f"DmaHeap alloc: fd={buf.fd}, {buf.size}B")
         buf.close()
     else:
         print("/dev/dma_heap not present on this system", file=sys.stderr)
 
-    sf = rkv.SurfaceFlinger(w=640, h=480)
+    sf = wdnav.SurfaceFlinger(w=640, h=480)
     s = sf.create_surface(0, 0, 640, 480, zpos=0, fmt="BGR888")
 
     buf = s.latest_ndarray

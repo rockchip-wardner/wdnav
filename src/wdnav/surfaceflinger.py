@@ -1,4 +1,4 @@
-"""Offscreen GLES compositor for rkv.
+"""Offscreen GLES compositor for wdnav.
 
 Implements an Android SurfaceFlinger-style architecture on top of libmali:
 
@@ -245,7 +245,7 @@ class SurfaceFlinger:
     handle. The default (``None``) walks ``eglGetDisplay(EGL_DEFAULT_DISPLAY)``
     + ``eglInitialize`` — the same path the rbs glengine uses for an
     X11/wayland compositor. Pass a different display (e.g. one obtained
-    via :func:`rkv.mali.get_display` with ``EGL_PLATFORM_GBM_KHR`` and a
+    via :func:`wdnav.mali.get_display` with ``EGL_PLATFORM_GBM_KHR`` and a
     gbm_device pointer) when you need dma-buf import to work on a build
     that doesn't support it on the default display.
     """
@@ -275,7 +275,7 @@ class SurfaceFlinger:
 
         self._thread = threading.Thread(
             target=self._worker_main,
-            name="rkv-gl-worker",
+            name="wdnav-gl-worker",
             daemon=True,
         )
         self._ready_event = threading.Event()

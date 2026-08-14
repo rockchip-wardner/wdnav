@@ -5,7 +5,7 @@ Designed to mirror the OpenCV ``VideoCapture`` calling convention so existing
 OpenCV-style pipelines can be retargeted at the Rockchip VPU with a one-line
 import swap. The heavy lifting (PyAV demux, AVCC→Annex B, SPS/PPS injection,
 NV12/YUYV → BGR via RGA2) lives in this module; the underlying ctypes
-binding to ``librockchip_mpp.so`` is ``rkv.mpp``.
+binding to ``librockchip_mpp.so`` is ``wdnav.mpp``.
 
 Every pixel-format conversion runs through RGA2 (``librockchip_mpp`` cannot
 do colour conversion on its own). If the requested format / size combo is
@@ -15,7 +15,7 @@ not accepted by the active RGA backend, ``VideoCapture.read`` raises
 Typical usage:
 
     import numpy as np
-    from rkv import VideoCapture
+    from wdnav import VideoCapture
 
     cap = VideoCapture("bus.mp4")
     while True:
@@ -40,7 +40,7 @@ from typing import Optional, Tuple
 import av
 import numpy as np
 
-# Note: ``rkv.v4l2`` (the upstream ``v4l2`` package) is **only** needed when
+# Note: ``wdnav.v4l2`` (the upstream ``v4l2`` package) is **only** needed when
 # opening a ``/dev/video*`` capture node. Importing it eagerly forces every
 # VideoCapture() call — including the common file/URL path — to pay the cost
 # of loading it, and triggers spurious import errors on environments where
@@ -113,7 +113,7 @@ def _demuxer_options_for(path_str: str) -> dict:
 # to be registered with libavcodec. We use that string as a fallback when
 # ``stream.codec_context`` is ``None`` (PyAV only populates a CodecContext after
 # ``avcodec_find_decoder`` succeeds, which fails for codecs missing from the
-# slim build of FFmpeg that the rkv samples bundle — see AGENTS.md).
+# slim build of FFmpeg that the wdnav samples bundle — see AGENTS.md).
 _VIDEO_STREAM_RE = re.compile(
     r"\bVideo:\s+(?P<codec>[A-Za-z0-9_]+)[^\n]*?"
     r"(?P<width>\d{2,5})x(?P<height>\d{2,5}),"
@@ -147,7 +147,7 @@ def _read_codec_config_box(path_str: str, kinds: Tuple[str, ...]) -> bytes:
 
     PyAV exposes the same data through ``stream.codec_context.extradata``, but
     only when the corresponding FFmpeg decoder has been registered; the slim
-    build shipped with the rkv samples deliberately omits decoders beyond H.264
+    build shipped with the wdnav samples deliberately omits decoders beyond H.264
     (see AGENTS.md). Walking the ISO BMFF box tree ourselves keeps the path
     demuxer-only and free of any avcodec dependency.
 
@@ -281,7 +281,7 @@ class VideoCapture:
     Notes
     -----
     Media Controller paths (``/dev/mediaX``) are **not** opened directly
-    — use :class:`rkv.media.MediaDevice` to inspect / configure the
+    — use :class:`wdnav.media.MediaDevice` to inspect / configure the
     pipeline first, then pass the resulting capture node to this class.
     """
 
@@ -302,7 +302,7 @@ class VideoCapture:
         if path_str.startswith("/dev/media"):
             raise RuntimeError(
                 f"{path_str}: this is a Media Controller device, not a "
-                f"capture node. Use rkv.media.MediaDevice to inspect / "
+                f"capture node. Use wdnav.media.MediaDevice to inspect / "
                 f"configure the pipeline, then open the resulting "
                 f"/dev/videoX with VideoCapture."
             )
@@ -411,7 +411,7 @@ class VideoCapture:
         framerate: Optional[int],
         output_size: Optional[Tuple[int, int]],
     ) -> None:
-        """Open a /dev/videoX node via rkv.v4l2.V4L2Capture.
+        """Open a /dev/videoX node via wdnav.v4l2.V4L2Capture.
 
         ``v4l2_input_format`` is a FourCC string (e.g. ``"nv12"``,
         ``"yuyv"``). ``v4l2_size`` and ``v4l2_framerate`` default to
@@ -527,7 +527,7 @@ class VideoCapture:
     ) -> Tuple[bool, Optional[DecodedFrame]]:
         """Pull the next raw decoded frame, without doing any RGA conversion.
 
-        Returns a :class:`rkv.mpp.DecodedFrame` whose ``fd`` is the
+        Returns a :class:`wdnav.mpp.DecodedFrame` whose ``fd`` is the
         DMA-BUF file descriptor of the underlying MPP buffer (or
         ``plane_fds[0]`` for V4L2 sources). Hand it to RGA, the display
         controller, or the encoder for hardware processing without
@@ -631,7 +631,7 @@ class VideoCapture:
     ) -> Tuple[bool, Optional[DecodedFrame]]:
         """V4L2 variant of :meth:`read0`.
 
-        Wraps the dequeued :class:`rkv.v4l2.V4L2BufferInfo` into a
+        Wraps the dequeued :class:`wdnav.v4l2.V4L2BufferInfo` into a
         :class:`DecodedFrame` so callers can use the uniform
         ``cap.read0(...).numpy()`` pattern. Only planar YUV formats
         (NV12 / NV21 / I420) are supported; YUYV / UYVY sensors must use

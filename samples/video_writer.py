@@ -1,10 +1,10 @@
 import cv2
-import rkv
+import wdnav
 
 
 def test_h264_encode():
     frame = cv2.imread('/userdata/test/demo.jpg')
-    writer = rkv.VideoWriter('/tmp/test.264')  # 不写的参数话默认尺寸为frame的尺寸
+    writer = wdnav.VideoWriter('/tmp/test.264')  # 不写的参数话默认尺寸为frame的尺寸
     for i in range(100):
         writer.write(frame)  # 这里才会初始化编码器
     writer.release()
@@ -13,11 +13,11 @@ def test_h264_encode():
 
 def test_hevc_encode():
     frame = cv2.imread('/userdata/test/demo.jpg')
-    writer = rkv.VideoWriter(
+    writer = wdnav.VideoWriter(
         '/tmp/test.265',
         fps=30,
         frame_size=(1920, 1080),  # 分辨率手动设置后编码前会经过RGA进行缩放
-        codec=rkv.VideoWriter.CODEC_HEVC_RAW,
+        codec=wdnav.VideoWriter.CODEC_HEVC_RAW,
         gop=60,
         bitrate=2_000_000,
         rc_mode='cbr',
@@ -31,7 +31,7 @@ def test_hevc_encode():
 def test_mp4_encode():
     frame = cv2.imread('/userdata/test/demo.jpg')
     h, w = frame.shape[:2]
-    writer = rkv.VideoWriter(
+    writer = wdnav.VideoWriter(
         '/tmp/test.mp4',
         fps=30,
         frame_size=(w, h),
@@ -50,7 +50,7 @@ def test_mp4_encode():
 def test_mkv_encode():
     frame = cv2.imread('/userdata/test/demo.jpg')
     h, w = frame.shape[:2]
-    writer = rkv.VideoWriter(
+    writer = wdnav.VideoWriter(
         '/tmp/test.mkv',
         fps=30,
         frame_size=(w, h),
@@ -69,11 +69,11 @@ def test_mkv_encode():
 def test_jpeg_encode():
     frame = cv2.imread('/userdata/test/demo.jpg')
     h, w = frame.shape[:2]
-    writer = rkv.VideoWriter(
+    writer = wdnav.VideoWriter(
         '/tmp/test.jpg',
         fps=30,
         frame_size=(w, h),
-        codec=rkv.VideoWriter.CODEC_JPEG,
+        codec=wdnav.VideoWriter.CODEC_JPEG,
         q_factor=80,
     )
     writer.write(frame)

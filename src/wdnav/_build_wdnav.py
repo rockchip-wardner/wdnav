@@ -1,18 +1,18 @@
 """setuptools build hook — compile the libshim_video.so C shim before wheel packaging.
 
-The package ships two C source files (``src/rkv/cshim_video_encoder.c``
-and ``src/rkv/cshim_video_decoder.c``) that wrap ``librockchip_mpp.so``
+The package ships two C source files (``src/wdnav/cshim_video_encoder.c``
+and ``src/wdnav/cshim_video_decoder.c``) that wrap ``librockchip_mpp.so``
 behind a small, opinionated surface (``rkv_enc_*`` / ``rkv_dec_*``).
 The shim has to be compiled for the wheel's target architecture
 before setuptools can package it, so this module provides a custom
 :class:`build_py` subclass that:
 
   1. Locates the Rockchip MPP public headers (default
-     ``/usr/include/rockchip``; override with ``RKV_MPP_INC`` env var);
+     ``/usr/include/rockchip``; override with ``WDNAV_MPP_INC`` env var);
   2. Invokes ``cc -shared -fPIC`` on both ``cshim_video_encoder.c``
      and ``cshim_video_decoder.c`` with that include path on the
      command line, linking them together into ``libshim_video.so``;
-  3. Drops the resulting ``libshim_video.so`` into ``src/rkv/lib/``
+  3. Drops the resulting ``libshim_video.so`` into ``src/wdnav/lib/``
      so setuptools' regular package-data machinery picks it up and
      bundles it in the wheel;
   4. Then defers to the standard ``build_py`` so Python source
@@ -27,19 +27,19 @@ Why not setuptools.distutils ``Extension`` / ``build_ext``?
 ``Extension`` would work for the compile step itself, but it ties the
 output path to the build_lib/build_platlib tree under ``build/`` and
 requires an extra ``build_clib`` / ``build_ext`` orchestration to
-copy the result back into the source tree's ``src/rkv/lib/`` where
+copy the result back into the source tree's ``src/wdnav/lib/`` where
 ``package_data`` knows to look. A direct ``subprocess.run`` keeps
 the build path trivially auditable and side-steps the
 ``build_py``/``build_ext`` ordering issue (mpp.py reads from
-``src/rkv/lib/libshim_video.so`` at import time, so the .so MUST
+``src/wdnav/lib/libshim_video.so`` at import time, so the .so MUST
 exist in the source tree before ``build_py`` copies the package out).
 
-Why is the hook a top-level module, not nested under ``rkv/``?
+Why is the hook a top-level module, not nested under ``wdnav/``?
 --------------------------------------------------------------
 setuptools' ``cmdclass`` discovery looks up the class by import path
-at the start of the build — *before* ``rkv`` has been installed.
-Putting the hook under ``rkv._build`` would force a chicken-and-egg
-import (rkv imports mpp imports _lib, _build imports rkv). A
+at the start of the build — *before* ``wdnav`` has been installed.
+Putting the hook under ``wdnav._build`` would force a chicken-and-egg
+import (wdnav imports mpp imports _lib, _build imports wdnav). A
 top-level module next to ``pyproject.toml`` is reachable as soon as
 setuptools adds the project root to ``sys.path``.
 """
@@ -60,7 +60,7 @@ from setuptools.command.build_py import build_py as _build_py
 # ---------------------------------------------------------------------------
 
 # Canonical location of the Rockchip MPP public headers on this
-# machine. Override at build time via ``RKV_MPP_INC=/path/to/inc`` for
+# machine. Override at build time via ``WDNAV_MPP_INC=/path/to/inc`` for
 # cross-builds / CI runners where the headers live elsewhere.
 _DEFAULT_MPP_INC = "/usr/include/rockchip"
 
@@ -68,7 +68,7 @@ _DEFAULT_MPP_INC = "/usr/include/rockchip"
 # headers above. Decoupled from ``_DEFAULT_MPP_INC`` because the Rockchip
 # upstream keeps headers under ``/usr/include/rockchip`` while Debian's
 # multiarch layout drops the shared library under
-# ``/usr/lib/aarch64-linux-gnu``. Override with ``RKV_MPP_LIB``.
+# ``/usr/lib/aarch64-linux-gnu``. Override with ``WDNAV_MPP_LIB``.
 _DEFAULT_MPP_LIB = "/usr/lib/aarch64-linux-gnu"
 
 # C source / output layout — relative to the project root. ``build_py``
@@ -76,8 +76,8 @@ _DEFAULT_MPP_LIB = "/usr/lib/aarch64-linux-gnu"
 # ``os.path.dirname(__file__)`` so the hook still works when invoked
 # from a different working directory (e.g. ``pip install .``).
 #
-# The hook lives at ``src/rkv/_build_rkv.py``, so ``__file__``'s
-# directory is the package directory ``src/rkv/``; the project
+# The hook lives at ``src/wdnav/_build_rkv.py``, so ``__file__``'s
+# directory is the package directory ``src/wdnav/``; the project
 # root is one level up.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_THIS_DIR)
@@ -94,7 +94,7 @@ def _resolve_mpp_inc() -> str:
 
     Resolution order:
 
-      1. ``RKV_MPP_INC`` environment variable (CI / cross-build knob);
+      1. ``WDNAV_MPP_INC`` environment variable (CI / cross-build knob);
       2. ``/usr/include/rockchip`` — the canonical Debian install path
          for the Rockchip public headers;
       3. The empty string — at which point we skip ``-I`` and let gcc
@@ -108,7 +108,7 @@ def _resolve_mpp_inc() -> str:
     with a clear ``fatal error: rk_mpi.h: No such file`` if the path
     is bogus.
     """
-    return os.environ.get("RKV_MPP_INC", _DEFAULT_MPP_INC)
+    return os.environ.get("WDNAV_MPP_INC", _DEFAULT_MPP_INC)
 
 
 def _resolve_cc() -> str:
@@ -151,14 +151,14 @@ def _build_command(cc: str, mpp_inc: str) -> List[str]:
         ``librockchip_mpp.so`` on hosts that don't have it in
         ``ldconfig``. ``mpp_lib_dir`` defaults to
         ``/usr/lib/aarch64-linux-gnu`` (Debian multiarch) and can be
-        overridden with ``RKV_MPP_LIB``.
+        overridden with ``WDNAV_MPP_LIB``.
 
     Both encoder and decoder C sources are listed in the same gcc
     invocation so gcc links them into a single ``.so``. Order
     matters: ``-o`` must come after the sources so gcc parses them
     for ``-I`` first.
     """
-    mpp_lib = os.environ.get("RKV_MPP_LIB", _DEFAULT_MPP_LIB)
+    mpp_lib = os.environ.get("WDNAV_MPP_LIB", _DEFAULT_MPP_LIB)
     cmd: List[str] = [
         cc,
         "-shared",
@@ -181,9 +181,9 @@ def _build_command(cc: str, mpp_inc: str) -> List[str]:
 
 def compile_shim(verbose: bool = False) -> None:
     """Compile ``cshim_video_encoder.c`` and ``cshim_video_decoder.c``
-    into ``src/rkv/lib/libshim_video.so``.
+    into ``src/wdnav/lib/libshim_video.so``.
 
-    Skipped silently when ``SKIP_RKV_VIDEO_BUILD=1`` is set in the
+    Skipped silently when ``SKIP_WDNAV_VIDEO_BUILD=1`` is set in the
     environment — useful for readthedocs / sdist-only builds where the
     C toolchain isn't available and we just want to ship Python
     sources. A warning is printed to stderr in that case so a
@@ -193,9 +193,9 @@ def compile_shim(verbose: bool = False) -> None:
     message includes the full gcc command line and its stderr so the
     cause is obvious without re-running the build.
     """
-    if os.environ.get("SKIP_RKV_VIDEO_BUILD") == "1":
+    if os.environ.get("SKIP_WDNAV_VIDEO_BUILD") == "1":
         sys.stderr.write(
-            "build_rkv: SKIP_RKV_VIDEO_BUILD=1, leaving "
+            "build_rkv: SKIP_WDNAV_VIDEO_BUILD=1, leaving "
             f"{_OUTPUT_SO} as-is (shim may be stale)\n"
         )
         return
@@ -209,7 +209,7 @@ def compile_shim(verbose: bool = False) -> None:
 
     mpp_inc = _resolve_mpp_inc()
     if mpp_inc and not os.path.isdir(mpp_inc):
-        # Don't hard-fail here — the user may have set RKV_MPP_INC to
+        # Don't hard-fail here — the user may have set WDNAV_MPP_INC to
         # a path that doesn't exist on this machine, but the system
         # /usr/include/rockchip tree might still satisfy the includes.
         # Drop the -I flag and let gcc try its default search path.
@@ -281,8 +281,8 @@ class build_py(_build_py):
     """
 
     user_options = _build_py.user_options + [
-        ("skip-rkv-video-build", None,
-         "Skip the C shim compile (sets SKIP_RKV_VIDEO_BUILD=1)."),
+        ("skip-wdnav-video-build", None,
+         "Skip the C shim compile (sets SKIP_WDNAV_VIDEO_BUILD=1)."),
     ]
 
     def initialize_options(self) -> None:
@@ -292,15 +292,15 @@ class build_py(_build_py):
     def finalize_options(self) -> None:
         super().finalize_options()
         if self.skip_rkv_video_build:
-            os.environ["SKIP_RKV_VIDEO_BUILD"] = "1"
+            os.environ["SKIP_WDNAV_VIDEO_BUILD"] = "1"
 
     def run(self) -> None:
         # Decide whether to skip the compile: an explicit opt-in, or
-        # ``SKIP_RKV_VIDEO_BUILD`` already set in the environment (e.g.
+        # ``SKIP_WDNAV_VIDEO_BUILD`` already set in the environment (e.g.
         # by a CI step that pre-built the .so), wins. Otherwise
         # always recompile when the .so is missing or any of the
         # source files are newer than the .so.
-        if not self.skip_rkv_video_build and os.environ.get("SKIP_RKV_VIDEO_BUILD") != "1":
+        if not self.skip_rkv_video_build and os.environ.get("SKIP_WDNAV_VIDEO_BUILD") != "1":
             src_mtime = max(os.path.getmtime(p) for p in _C_SOURCES)
             needs_rebuild = (
                 not os.path.exists(_OUTPUT_SO)

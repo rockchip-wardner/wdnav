@@ -8,8 +8,8 @@ are documented under ``im2d.h`` / ``im2d_single.h`` / ``im2d_common.h``.
 The library is **not** bundled with this package. It must be installed
 system-wide; see :func:`_load_library` for the lookup order. If neither
 ``/usr/lib/aarch64-linux-gnu/librga.so.2`` nor an ldconfig-registered
-``librga`` resolves, the import of :mod:`rkv` ``VideoCapture`` falls
-back to ``None`` (see :mod:`rkv.__init__`).
+``librga`` resolves, the import of :mod:`wdnav` ``VideoCapture`` falls
+back to ``None`` (see :mod:`wdnav.__init__`).
 
 Why im2d (not the older ``c_RkRga*`` API):
   - **Auto-dispatches between RGA2 and RGA3** at runtime. The im2d
@@ -35,7 +35,7 @@ but add name-mangling to a C linkage. We use the C variants throughout.
 
 Typical use (NV12 fd from MPP → BGR + resize on hardware):
 
-    import rkv.rga as rga
+    import wdnav.rga as rga
 
     src = rga.import_nv12_fd(frame.fd, frame.width, frame.height)
     dst = rga.import_bgr_va(dst_addr, out_w, out_h)
@@ -879,7 +879,7 @@ def resize_bgr(
       (OpenCV convention). The buffer is registered in-place via
       :func:`wrap_virtual`; the caller may keep using it after this
       call returns because RGA's wrap is by reference.
-    * ``rkv.mpp.DecodedFrame`` (or any object exposing ``width``,
+    * ``wdnav.mpp.DecodedFrame`` (or any object exposing ``width``,
       ``height``, ``fd``, ``ptr``, ``fmt``, ``hor_stride``,
       ``ver_stride``) — the zero-copy DMA-BUF frame. Uses
       :meth:`DecodedFrame.numpy` internally with ``fmt="BGR"`` so the

@@ -1,4 +1,4 @@
-"""Standalone demo of rkv.DmaHeap — allocate DMA-BUF fds and use them.
+"""Standalone demo of wdnav.DmaHeap — allocate DMA-BUF fds and use them.
 
 The DMA-BUF heap allocator is the canonical way to obtain fd-backed
 buffers that can be handed across hardware engines (VPU, RGA, EGL via
@@ -6,7 +6,7 @@ buffers that can be handed across hardware engines (VPU, RGA, EGL via
 writes a checkerboard into it via mmap, and reports what we got back.
 
 The interesting follow-on is to wrap the fd with
-``rkv.mali.create_image_dma_buf`` (matching the layout in
+``wdnav.mali.create_image_dma_buf`` (matching the layout in
 ``/userdata/rbs/frameworks/glengine/buffer_gl_image.cpp``) so the
 SurfaceFlinger worker can composite it on the GPU.
 
@@ -17,15 +17,15 @@ from __future__ import annotations
 import mmap
 import sys
 
-import rkv
+import wdnav
 
 
 def main() -> int:
-    if rkv.DmaHeap is None:
+    if wdnav.DmaHeap is None:
         print("/dev/dma_heap not present on this system", file=sys.stderr)
         return 1
 
-    heaps = rkv.list_heaps()
+    heaps = wdnav.list_heaps()
     if not heaps:
         print("no dma-heap devices available", file=sys.stderr)
         return 1
@@ -34,7 +34,7 @@ def main() -> int:
     name = sys.argv[1] if len(sys.argv) > 1 else "system"
     size = int(sys.argv[2]) if len(sys.argv) > 2 else (1920 * 1088 * 3 // 2)
 
-    with rkv.DmaHeap(name) as heap:
+    with wdnav.DmaHeap(name) as heap:
         with heap.alloc(size) as buf:
             print(f"heap={name}  size={buf.size}  fd={buf.fd}")
 

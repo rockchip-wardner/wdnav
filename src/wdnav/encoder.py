@@ -3,9 +3,9 @@
 Replaces the original cv2.VideoWriter / cv2.imencode based sink. The
 encoded byte stream comes from one backend:
 
-  * **MPP** (hardware) — :class:`rkv.mpp.MppEncoder`. The encoder
+  * **MPP** (hardware) — :class:`wdnav.mpp.MppEncoder`. The encoder
     runs on the Rockchip VPU and accepts BGR / NV12 / I420 input.
-    When the input is a :class:`rkv.mpp.DecodedFrame` (zero-copy
+    When the input is a :class:`wdnav.mpp.DecodedFrame` (zero-copy
     DMA-BUF straight from :meth:`VideoCapture.read0`) the encoder
     imports the decoder's fd as an :class:`MppBuffer` via
     ``mpp_buffer_import_with_tag`` and feeds it straight to the
@@ -15,18 +15,18 @@ encoded byte stream comes from one backend:
     encoded NALs into the requested container (MP4 / MKV / …).
 
   H.264 is MPP-only — there is no software fallback. Picking
-  ``codec="h264"`` on a box where :class:`rkv.mpp.MppEncoder` can't
+  ``codec="h264"`` on a box where :class:`wdnav.mpp.MppEncoder` can't
   initialise (no Rockchip SoC, or an MPP build that rejects the
   requested width / profile) raises ``RuntimeError`` at construction
   time. There is no software codec fallback — every codec goes
   through MPP, and on non-Rockchip boxes the constructor raises.
 
-The ``rkv+ws://`` sink supports two wire formats:
+The ``wdnav+ws://`` sink supports two wire formats:
 
   * ``codec="mjpeg"`` (default) — PyAV's software MJPEG encoder,
     one packet per frame. JPEG is the simplest wire format that
     pyrkaiweb's ingest handler accepts.
-  * ``codec="h264"`` — :class:`rkv.mpp.MppEncoder` for VPU H.264,
+  * ``codec="h264"`` — :class:`wdnav.mpp.MppEncoder` for VPU H.264,
     laid out as avcC header + 4-byte length-prefixed NAL access
     units (MSE-friendly). Backend selection: ``"ws-h264-mpp"`` on
     Rockchip, ``RuntimeError`` if MPP isn't available.
@@ -39,7 +39,7 @@ work unchanged:
     out.write(frame)                # BGR (H, W, 3) uint8 ndarray
     out.write(frame0)              # DecodedFrame with .fd (zero-copy)
 
-    out = VideoWriter("rkv+ws://host:9999/source", fps=30,
+    out = VideoWriter("wdnav+ws://host:9999/source", fps=30,
                       frame_size=(640, 360),
                       codec="h264", gop=30, bitrate=2_000_000)
     # → sends avcC header + length-prefixed H.264 NAL units over WS
@@ -97,7 +97,7 @@ PKT_TYPE_KEY = 0x01
 PKT_TYPE_HEADER = 0x02
 PKT_TYPE_EOS = 0xFF
 
-# Default JPEG quality for the rkv+ws:// sink.
+# Default JPEG quality for the wdnav+ws:// sink.
 _WS_JPEG_QUALITY = 75
 
 # MPP's MJPEG encoder on the ``cfg-kcfg`` init path (the path we have
@@ -137,7 +137,7 @@ _H264_PROFILE_BY_NAME = {
 #                                  OpenCV / FFmpeg default to)
 #
 # Unknown extensions default to ``h264`` so an explicit ``codec=``
-# override isn't required for ``rkv+ws://`` URIs either.
+# override isn't required for ``wdnav+ws://`` URIs either.
 _DEFAULT_CODEC_BY_EXT = {
     "264": "h264_raw",
     "h264": "h264_raw",
@@ -277,7 +277,7 @@ class VideoWriter:
     path:
         Output sink. Either a local file path (extension determines
         container — PyAV handles MP4/MKV/AVI/etc.) or an
-        ``rkv+ws://host:port/source_id`` URL pointing at a pyrkaiweb
+        ``wdnav+ws://host:port/source_id`` URL pointing at a pyrkaiweb
         ingest endpoint.
     fps:
         Output frame rate (Hz).
@@ -285,7 +285,7 @@ class VideoWriter:
         ``(width, height)``. Optional — when omitted (or passed as
         ``(0, 0)``) the encoder backend is initialised lazily on the
         first :meth:`write` call using the size of the first frame.
-        A :class:`rkv.mpp.DecodedFrame` contributes ``width`` /
+        A :class:`wdnav.mpp.DecodedFrame` contributes ``width`` /
         ``height``; a BGR ndarray contributes ``(frame.shape[1],
         frame.shape[0])``. The width and height of every subsequent
         frame must match the first one.
@@ -343,10 +343,10 @@ class VideoWriter:
         Used as the default when the caller doesn't pass ``codec=``
         to :meth:`__init__`. The mapping is in ``_DEFAULT_CODEC_BY_EXT``;
         unknown extensions fall back to ``"h264"`` so the writer is
-        always usable. ``rkv+ws://`` URIs always default to ``"h264"``
+        always usable. ``wdnav+ws://`` URIs always default to ``"h264"``
         — the wire-format protocol's most common codec.
         """
-        if path.startswith("rkv+ws://"):
+        if path.startswith("wdnav+ws://"):
             return VideoWriter.CODEC_H264
         ext = os.path.splitext(path)[1].lstrip(".").lower()
         return _DEFAULT_CODEC_BY_EXT.get(ext, VideoWriter.CODEC_H264)
@@ -431,7 +431,7 @@ class VideoWriter:
         self._raw_extradata_written: bool = False
         self._raw_single_frame_written: bool = False
 
-        if path.startswith("rkv+ws://"):
+        if path.startswith("wdnav+ws://"):
             # Open the WS sink immediately so writes can flow as soon
             # as the encoder backend is up. The H.264 encoder + avcC
             # header send are deferred to the first ``write()`` when
@@ -473,7 +473,7 @@ class VideoWriter:
             except Exception as e:
                 name = "H.264" if codec == self.CODEC_H264_RAW else "HEVC"
                 raise RuntimeError(
-                    f"rkv.VideoWriter: raw {name} encoding requires MPP "
+                    f"wdnav.VideoWriter: raw {name} encoding requires MPP "
                     f"hardware encoder but initialization failed: {e}."
                 ) from e
             self._backend = (
@@ -489,7 +489,7 @@ class VideoWriter:
                 self._init_mpp_raw_jpeg(path)
             except Exception as e:
                 raise RuntimeError(
-                    f"rkv.VideoWriter: raw JPEG encoding requires MPP "
+                    f"wdnav.VideoWriter: raw JPEG encoding requires MPP "
                     f"hardware encoder but initialization failed: {e}."
                 ) from e
             self._backend = "mpp-jpeg"
@@ -501,7 +501,7 @@ class VideoWriter:
                 self._init_mpp(path)
             except Exception as e:
                 raise RuntimeError(
-                    f"rkv.VideoWriter: H.264 local-file encoding requires "
+                    f"wdnav.VideoWriter: H.264 local-file encoding requires "
                     f"MPP hardware encoder but MppEncoder.init failed: "
                     f"{e}. Run on Rockchip hardware."
                 ) from e
@@ -514,7 +514,7 @@ class VideoWriter:
                 self._init_mpp_mjpeg(path, q_factor=q_factor)
             except Exception as e:
                 raise RuntimeError(
-                    f"rkv.VideoWriter: MJPEG local-file encoding requires "
+                    f"wdnav.VideoWriter: MJPEG local-file encoding requires "
                     f"MPP hardware JPEG encoder but MppEncoder.init failed: "
                     f"{e}. Run on Rockchip hardware."
                 ) from e
@@ -529,7 +529,7 @@ class VideoWriter:
 
         Called from :meth:`write` when the writer was constructed
         without a positive ``frame_size``. Pulls ``width`` /
-        ``height`` from a :class:`rkv.mpp.DecodedFrame` or, for a
+        ``height`` from a :class:`wdnav.mpp.DecodedFrame` or, for a
         BGR ndarray, derives them from ``frame.shape`` (``(W, H) =
         (frame.shape[1], frame.shape[0])``). For a :class:`DecodedFrame`
         the per-row padding (``hor_stride`` / ``ver_stride``) is also
@@ -577,7 +577,7 @@ class VideoWriter:
         path = self._path
         codec = self._codec
 
-        if path.startswith("rkv+ws://"):
+        if path.startswith("wdnav+ws://"):
             # WS sink was already opened in ``__init__`` — only the
             # encoder backend (and the avcC header send for H.264)
             # needs to come up now that we know the size.
@@ -600,7 +600,7 @@ class VideoWriter:
             except Exception as e:
                 name = "H.264" if codec == self.CODEC_H264_RAW else "HEVC"
                 raise RuntimeError(
-                    f"rkv.VideoWriter: raw {name} encoding requires MPP "
+                    f"wdnav.VideoWriter: raw {name} encoding requires MPP "
                     f"hardware encoder but initialization failed: {e}."
                 ) from e
             self._backend = (
@@ -615,7 +615,7 @@ class VideoWriter:
                 self._init_mpp_raw_jpeg(path)
             except Exception as e:
                 raise RuntimeError(
-                    f"rkv.VideoWriter: raw JPEG encoding requires MPP "
+                    f"wdnav.VideoWriter: raw JPEG encoding requires MPP "
                     f"hardware encoder but initialization failed: {e}."
                 ) from e
             self._backend = "mpp-jpeg"
@@ -626,7 +626,7 @@ class VideoWriter:
                 self._init_mpp(path)
             except Exception as e:
                 raise RuntimeError(
-                    f"rkv.VideoWriter: H.264 local-file encoding requires "
+                    f"wdnav.VideoWriter: H.264 local-file encoding requires "
                     f"MPP hardware encoder but MppEncoder.init failed: "
                     f"{e}. Run on Rockchip hardware."
                 ) from e
@@ -638,7 +638,7 @@ class VideoWriter:
                 self._init_mpp_mjpeg(path, q_factor=self._q_factor)
             except Exception as e:
                 raise RuntimeError(
-                    f"rkv.VideoWriter: MJPEG local-file encoding requires "
+                    f"wdnav.VideoWriter: MJPEG local-file encoding requires "
                     f"MPP hardware JPEG encoder but MppEncoder.init failed: "
                     f"{e}. Run on Rockchip hardware."
                 ) from e
@@ -952,7 +952,7 @@ class VideoWriter:
         * ``PKT_TYPE_EOS`` on :meth:`release`.
 
         H.264 on the WS path is MPP-only — there is no software
-        fallback. If :class:`rkv.mpp.MppEncoder` can't initialise
+        fallback. If :class:`wdnav.mpp.MppEncoder` can't initialise
         here (no Rockchip SoC, or an MPP build that rejects the
         requested width / profile), we raise ``RuntimeError`` so
         the caller knows to fall back to a JPEG sink or a
@@ -981,7 +981,7 @@ class VideoWriter:
             )
         except Exception as e:
             raise RuntimeError(
-                f"rkv.VideoWriter: H.264 over rkv+ws:// requires MPP "
+                f"wdnav.VideoWriter: H.264 over wdnav+ws:// requires MPP "
                 f"hardware encoder but MppEncoder.init failed: {e}. "
                 f"Use codec='mjpeg' instead, or run on Rockchip hardware."
             ) from e
@@ -1018,7 +1018,7 @@ class VideoWriter:
         * a ``(H, W, 3)`` ``uint8`` BGR ndarray — OpenCV-compatible.
           The frame is copied into the encoder's internal buffer
           (1 CPU memmove) and the encoder handles BGR→YUV on-chip.
-        * a :class:`rkv.mpp.DecodedFrame` (zero-copy DMA-BUF). The
+        * a :class:`wdnav.mpp.DecodedFrame` (zero-copy DMA-BUF). The
           path depends on the codec:
 
           - **H.264 (MP4 / WS)** — the DMA-BUF fd is imported as an
@@ -1033,7 +1033,7 @@ class VideoWriter:
             DMA-BUF (``mpp_enc_check_pkt_buf`` assertion on this
             firmware), so the zero-copy path is skipped. The
             DecodedFrame is converted to NV12 via RGA in one pass
-            (:meth:`rkv.mpp.DecodedFrame.numpy` with ``fmt="NV12"``)
+            (:meth:`wdnav.mpp.DecodedFrame.numpy` with ``fmt="NV12"``)
             and fed to a YUV420SP-configured MJPEG encoder. The
             encoder is rebuilt on the first frame if it was
             initialised for BGR. This is still one RGA pass, no
@@ -1058,7 +1058,7 @@ class VideoWriter:
         # When the caller's frame geometry doesn't match the encoder's
         # configured size, scale via RGA before forwarding to the
         # encoder. Covers both BGR ndarray and zero-copy
-        # ``DecodedFrame`` inputs — ``rkv.rga.resize_bgr`` handles
+        # ``DecodedFrame`` inputs — ``wdnav.rga.resize_bgr`` handles
         # both in one RGA pass. Auto-scaling replaces ``frame`` with a
         # fresh BGR ndarray, so the zero-copy path below is skipped
         # (``encode_external_fd`` cannot change geometry). When sizes
@@ -1129,7 +1129,7 @@ class VideoWriter:
                 # Fall through to the eager BGR path so the writer
                 # still produces a valid output.
                 print(
-                    f"rkv.encoder: zero-copy encode_external_fd failed "
+                    f"wdnav.encoder: zero-copy encode_external_fd failed "
                     f"({e}); falling back to eager BGR path",
                     flush=True,
                 )
@@ -1522,7 +1522,7 @@ class VideoWriter:
                 )
             except RuntimeError as e:
                 print(
-                    f"rkv.encoder: WS zero-copy encode_external_fd failed "
+                    f"wdnav.encoder: WS zero-copy encode_external_fd failed "
                     f"({e}); falling back to eager BGR path",
                     flush=True,
                 )
@@ -1532,7 +1532,7 @@ class VideoWriter:
     def _decoded_frame_to_bgr(self, frame) -> np.ndarray:
         """Best-effort ``DecodedFrame`` → BGR ndarray (zero-copy path).
 
-        Calls :meth:`rkv.mpp.DecodedFrame.numpy` with BGR as the
+        Calls :meth:`wdnav.mpp.DecodedFrame.numpy` with BGR as the
         requested format. Any failure here surfaces a clear error so
         the caller knows the zero-copy path didn't take.
         """
@@ -1550,7 +1550,7 @@ class _WebSocketSink:
     """Persistent WebSocket client to a pyrkaiweb ingest endpoint.
 
     Stdlib socket + a hand-rolled RFC 6455 handshake / frame writer so
-    rkv doesn't need to pull in ``websockets`` or ``aiohttp``. Per-frame
+    wdnav doesn't need to pull in ``websockets`` or ``aiohttp``. Per-frame
     cost is small (one mask + a few header bytes) so the lack of TLS
     acceleration isn't critical; ``wss://`` is a one-line addition if
     needed later (``ssl.wrap_socket`` around ``socket.create_connection``).
@@ -1561,12 +1561,12 @@ class _WebSocketSink:
 
     def __init__(self, url: str) -> None:
         parsed = urllib.parse.urlparse(url)
-        # Accept both ``rkv+ws://host:port/path`` and bare
+        # Accept both ``wdnav+ws://host:port/path`` and bare
         # ``host:port/path`` (no scheme) forms.
-        accepted_scheme = parsed.scheme in ("", "rkv+ws", "rkv+http", "rkv+tcp")
+        accepted_scheme = parsed.scheme in ("", "wdnav+ws", "wdnav+http", "wdnav+tcp")
         if not accepted_scheme or not parsed.hostname:
             raise ValueError(
-                f"rkv+ws:// URL must be of the form rkv+ws://host:port/path, got {url!r}"
+                f"wdnav+ws:// URL must be of the form wdnav+ws://host:port/path, got {url!r}"
             )
         host = parsed.hostname
         port = parsed.port or 80

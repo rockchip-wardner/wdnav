@@ -7,7 +7,7 @@ own a Linux DMA-BUF file descriptor:
   allocator. Available on any reasonably modern (5.6+) kernel with
   ``CONFIG_DMABUF_HEAPS`` enabled. Uses one ioctl, returns a fresh fd,
   no DRM dependency.
-* :class:`RkDmaBuf` — legacy Rockchip-specific path, mirrored on
+* :class:`WdnavDmaBuf` — legacy Rockchip-specific path, mirrored on
   ``/userdata/rbs/core/buffers/allocator_drm.cpp``: ``DRM_IOCTL_ROCKCHIP_GEM_CREATE``
   on ``/dev/dri/card0`` followed by ``drmPrimeHandleToFD``. Use this
   only when running against an older Rockchip kernel that does not
@@ -17,16 +17,16 @@ own a Linux DMA-BUF file descriptor:
 
 Both paths produce a real ``/dmabuf:N`` fd. Whether that fd is then
 accepted by the libmali ``eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT, ...)``
-path is a separate concern — see :mod:`rkv.mali` and the reference
+path is a separate concern — see :mod:`wdnav.mali` and the reference
 ``/userdata/rbs/frameworks/glengine/buffer_gl_image.cpp`` for the
 attribute layout.
 
 Typical use as a producer-side buffer for the GPU compositor:
 
-    import rkv.dmaheap as dh
+    import wdnav.dmaheap as dh
     with dh.DmaHeap("system") as heap:
         with heap.alloc(1920 * 1080 * 3 // 2) as buf:
-            # ... mmap / fill / or wrap in EGLImage via rkv.mali ...
+            # ... mmap / fill / or wrap in EGLImage via wdnav.mali ...
             pass
 """
 
@@ -61,7 +61,7 @@ class DmaBuf:
     Owns the fd; closing the object closes the fd (and thus releases the
     underlying buffer to the heap allocator). Most user code should use
     this object directly without worrying about the underlying integer
-    fd; it can be passed to :meth:`rkv.mali.create_image_dma_buf` via the
+    fd; it can be passed to :meth:`wdnav.mali.create_image_dma_buf` via the
     :attr:`fd` property.
     """
 
@@ -256,11 +256,11 @@ _RK_BO_CACHABLE = 1 << 1
 _RK_BO_WC = 1 << 2
 
 
-class RkDmaBufError(DmaHeapError):
+class WdnavDmaBufError(DmaHeapError):
     """Raised when the Rockchip DRM GEM path cannot satisfy an allocation."""
 
 
-class RkDmaBuf:
+class WdnavDmaBuf:
     """Legacy Rockchip-specific DMA-BUF allocator.
 
     Mirrors ``/userdata/rbs/core/buffers/allocator_drm.cpp``: opens
@@ -276,7 +276,7 @@ class RkDmaBuf:
 
     The constructor intentionally does not probe whether the
     Rockchip-specific ioctl is supported on the running kernel;
-    :meth:`alloc` will raise :class:`RkDmaBufError` on first use if
+    :meth:`alloc` will raise :class:`WdnavDmaBufError` on first use if
     the kernel rejects the ioctl. ``alloc_contig`` and
     ``alloc_wc`` helpers pre-set the matching ``ROCKCHIP_BO_*`` flags.
     """
@@ -299,7 +299,7 @@ class RkDmaBuf:
         try:
             fcntl.ioctl(self._card, _RK_GEM_CREATE_IOCTL, buf)
         except OSError as e:
-            raise RkDmaBufError(
+            raise WdnavDmaBufError(
                 f"DRM_IOCTL_ROCKCHIP_GEM_CREATE failed (errno={e.errno}, "
                 f"{e.strerror}); kernel may not support this ioctl — "
                 f"try DmaHeap instead"
@@ -315,7 +315,7 @@ class RkDmaBuf:
                 _rk_gem_close(self._card, handle)
             except OSError:
                 pass
-            raise RkDmaBufError(
+            raise WdnavDmaBufError(
                 f"drmPrimeHandleToFD failed (errno={e.errno}, {e.strerror})"
             ) from e
         fd = ctypes.c_int32.from_buffer(fd_buf, 8).value
@@ -383,7 +383,7 @@ class RkDmaBuf:
         except OSError:
             pass
 
-    def __enter__(self) -> "RkDmaBuf":
+    def __enter__(self) -> "WdnavDmaBuf":
         return self
 
     def __exit__(self, *exc) -> None:
@@ -400,7 +400,7 @@ class RkDmaBuf:
             f"fd={self._fd}, handle=0x{self._handle:x}, {self._size}B"
             if self._fd >= 0 else "ready"
         )
-        return f"<RkDmaBuf {state}>"
+        return f"<WdnavDmaBuf {state}>"
 
 
 def _rk_gem_close(card_fd: int, handle: int) -> None:
@@ -415,7 +415,7 @@ __all__ = [
     "DmaHeap",
     "DmaBuf",
     "DmaHeapError",
-    "RkDmaBuf",
-    "RkDmaBufError",
+    "WdnavDmaBuf",
+    "WdnavDmaBufError",
     "list_heaps",
 ]

@@ -85,9 +85,9 @@
 /* Module / function tag strings for MPP's buffer-group debug logs.
  * These are plain (char *) — MPP's tag slots take ``const char *``,
  * and the byte-string ``b"..."`` syntax is C++-only. */
-#define RKV_TAG_MODULE  "rkv-shim"
-#define RKV_TAG_PACKET  "rkv-dec-pkt"
-#define RKV_TAG_INFO    "rkv-dec-info"
+#define RKV_TAG_MODULE  "wdnav-shim"
+#define RKV_TAG_PACKET  "wdnav-dec-pkt"
+#define RKV_TAG_INFO    "wdnav-dec-info"
 
 struct rkv_decoder {
     MppCtx       ctx;

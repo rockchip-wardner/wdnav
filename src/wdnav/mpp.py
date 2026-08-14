@@ -2,9 +2,9 @@
 ``libshim_video.so`` C shim.
 
 This module is now a thin glue layer between Python callers
-(``rkv.video.VideoCapture``, ``rkv.encoder.VideoWriter``) and the
+(``wdnav.video.VideoCapture``, ``wdnav.encoder.VideoWriter``) and the
 high-level ``rkv_enc_*`` / ``rkv_dec_*`` C wrappers in
-``src/rkv/cshim_video_encoder.c`` / ``src/rkv/cshim_video_decoder.c``.
+``src/wdnav/cshim_video_encoder.c`` / ``src/wdnav/cshim_video_decoder.c``.
 Those wrappers hide all the MppPacket / MppFrame / MppBuffer handle
 plumbing — what used to be hundreds of lines of ctypes calls in this
 module is now a handful of function calls into the shim.
@@ -80,7 +80,7 @@ def _load_library():
             "Could not load libshim_video.so from the package lib/ "
             "directory or via ldconfig. The package ships "
             "libshim_video.so (compiled from "
-            "src/rkv/cshim_video_encoder.c / cshim_video_decoder.c "
+            "src/wdnav/cshim_video_encoder.c / cshim_video_decoder.c "
             "at wheel-build time); if it's missing, the wheel was "
             "built without the C shim step — see _build_rkv.py at "
             "the project root. Install librockchip-mpp system-wide "
@@ -562,7 +562,7 @@ class DecodedFrame:
 
         Returns a new :class:`DecodedFrame` holding a freshly allocated
         DMA-BUF (``fd >= 0``) that owns the cropped pixel data, so it can
-        be handed straight to :meth:`rkv.encoder.VideoWriter.write` for
+        be handed straight to :meth:`wdnav.encoder.VideoWriter.write` for
         zero-copy ``encode_external_fd``, or chained with
         :meth:`numpy` (``fmt="BGR"``) for an ndarray. The source pixel
         format is preserved — for colour conversion chain ``.crop(...)``

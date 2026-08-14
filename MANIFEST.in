@@ -11,12 +11,12 @@ include build_rkv.py
 
 # C shim 源码：build hook 在 wheel build 时会现场编译，但 sdist 必须带
 # 源码，否则纯源码安装路径拿不到 cshim_video_*.c。
-include src/rkv/cshim_video_encoder.c
-include src/rkv/cshim_video_decoder.c
+include src/wdnav/cshim_video_encoder.c
+include src/wdnav/cshim_video_decoder.c
 
 # 类型 stub
-include src/rkv/py.typed
-include src/rkv/*.pyi
+include src/wdnav/py.typed
+include src/wdnav/*.pyi
 
 # 排除常见的临时/构建产物
 global-exclude __pycache__
@@ -25,11 +25,11 @@ global-exclude .pytest_cache
 global-exclude *.egg-info
 global-exclude build dist .tox .venv
 
-# 排除 src/rkv/lib/ 里手编 / 开发期拷贝的 native 文件 —— wheel 阶段会由
+# 排除 src/wdnav/lib/ 里手编 / 开发期拷贝的 native 文件 —— wheel 阶段会由
 # build hook 现场编译出 libshim_video.so；librockchip_mpp.so* 是开发机器
-# 上的预编译拷贝，不应随 rkv 包一起发布。
-exclude src/rkv/lib/librockchip_mpp.so.0
-exclude src/rkv/lib/librockchip_mpp.so.1
-exclude src/rkv/lib/librockchip_mpp.so
-exclude src/rkv/lib/libshim_video.so
-exclude src/rkv/lib/rkv_video.so
+# 上的预编译拷贝，不应随 wdnav 包一起发布。
+exclude src/wdnav/lib/librockchip_mpp.so.0
+exclude src/wdnav/lib/librockchip_mpp.so.1
+exclude src/wdnav/lib/librockchip_mpp.so
+exclude src/wdnav/lib/libshim_video.so
+exclude src/wdnav/lib/rkv_video.so
