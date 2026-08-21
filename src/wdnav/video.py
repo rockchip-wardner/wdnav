@@ -382,15 +382,26 @@ class VideoCapture:
         # ``CODING_BY_NAME`` always hands back a normalised ffmpeg name
         # (``h264`` / ``hevc``); the extra aliases are kept for callers
         # that set ``codec_name`` directly on a custom-built container.
+        #
+        # For local files the avcC/hvcC lives inside the ISOBMFF box tree
+        # (``_read_codec_config_box`` walks that tree); for network streams
+        # (rtsp://, rtmp://, http://, …) there is no box tree — PyAV parses
+        # the SDP ``sprop-parameter-sets=`` field during RTSP DESCRIBE and
+        # exposes the resulting avcC/hvcC blob as ``stream.codec_context.extradata``.
+        # Reading the URL as a file (the previous behaviour) raises
+        # FileNotFoundError long before the decoder sees any frame.
+        ctx = self._stream.codec_context
         if codec_name in ("h264", "avc1"):
-            config_box = _read_codec_config_box(
-                path_str, ("avcC",)
-            )
+            if "://" in path_str:
+                config_box = ctx.extradata if ctx is not None else b""
+            else:
+                config_box = _read_codec_config_box(path_str, ("avcC",))
             self._sps_pps = parse_avcc_extradata(config_box)
         elif codec_name in ("hevc", "h265", "hvc1", "hev1"):
-            config_box = _read_codec_config_box(
-                path_str, ("hvcC",)
-            )
+            if "://" in path_str:
+                config_box = ctx.extradata if ctx is not None else b""
+            else:
+                config_box = _read_codec_config_box(path_str, ("hvcC",))
             self._sps_pps = parse_hvcc_extradata(config_box)
         else:
             self._sps_pps = b""
