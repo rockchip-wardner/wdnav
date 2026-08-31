@@ -72,3 +72,30 @@ out.write(frame0)  # 0拷贝接口，传入dmabuffer结构体
 - 用中文回答
 - 除非我要求，否则不要自动提交git commit
 - 由于视频编码出现python调用mpp和c调用mpp得到的sps pps不一致问题，所以我们封装一层高级的c shim接口给python调用
+
+## 编译策略 — `libshim_video.so` (v0.3.1 unconditional rebuild)
+
+`src/wdnav/_build_wdnav.py::build_py.run()` 在每次 `pip install` /
+`pip install -e` 时**无条件** `os.unlink(_OUTPUT_SO)` 然后 `compile_shim()`,
+不再走 mtime 比较的 fast path。代价是两段 `.c` 的 gcc 编译 ~5s。
+
+**为什么改**:旧的 mtime 检查 (`os.path.getmtime(_OUTPUT_SO) < src_mtime`)
+只比 C 源 (`cshim_video_encoder.c` / `cshim_video_decoder.c`),
+但 `import wdnav` 时 `mpp.py` 等会在 module 顶部执行
+`_lib.rkv_xxx.argtypes = [...]`(module-level ctypes 绑定)。
+如果新 commit 在 `mpp.py` / `rga.py` / `video.py` / `encoder.py`
+里加了一个 `_lib.rkv_new_feature.argtypes = [...]` 的绑定而
+`cshim_video_*.c` 没改,mtime 不动、hook 跳过 rebuild,`import wdnav`
+会立刻抛 `AttributeError: .../libshim_video.so: undefined symbol: rkv_new_feature`
+—— 跟 wdndds 0.6.1 修掉的 `wdndds_topic_writer_create` 是同一个 trap
+(只是入口不同:wdndds 是 `Hub()`,wdnav 是 `import wdnav`)。
+
+**显式跳过**(不删、不重编):
+- CLI: `--skip-wdnav-video-build`
+- Env: `SKIP_WDNAV_VIDEO_BUILD=1`
+适用于 CI 预编 `libshim_video.so` 的生产镜像;本机 dev box 不应跳过。
+
+**未变**:
+- `_C_SOURCES` 仍是那两个 `.c` 文件
+- 输出路径仍是 `src/wdnav/lib/libshim_video.so`
+- `compile_shim()` 本身的 cmake-style 注释 / 输出格式 / cross-build env vars (`WDNAV_MPP_INC` / `WDNAV_MPP_LIB`) 全部保留

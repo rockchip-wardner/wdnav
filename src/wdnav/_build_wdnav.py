@@ -273,11 +273,17 @@ class build_py(_build_py):
         do something extra between finalizing options and copying
         Python sources", which is exactly our case.
 
-    The compile is a no-op if the .so is already up to date *and* the
-    source tree is older than the .so — a small touch that keeps
-    ``pip install -e .`` fast on iterative development. The touch
-    check is intentionally simple (``mtime`` only): the shim is a
-    pair of small files, so a finer-grained hash is overkill.
+    v0.3.1: unconditional rebuild — delete any pre-existing
+    ``libshim_video.so`` and recompile on every ``pip install`` /
+    ``pip install -e``. The previous mtime-only check missed the
+    case where Python wrappers added a new ``_lib.rkv_xxx.argtypes``
+    binding without the C sources changing, leaving a stale ``.so``
+    that ``import wdnav`` would crash on with
+    ``AttributeError: undefined symbol`` (same trap wdndds 0.6.1
+    closed for ``libwdndds_cshim.so`` / ``wdndds_topic_*``). Cost
+    is the two-file gcc compile (~5s on this dev box). Explicit
+    opt-outs still respected: ``--skip-wdnav-video-build`` CLI flag
+    or ``SKIP_WDNAV_VIDEO_BUILD=1`` env var (CI pre-built images).
     """
 
     user_options = _build_py.user_options + [
@@ -295,24 +301,32 @@ class build_py(_build_py):
             os.environ["SKIP_WDNAV_VIDEO_BUILD"] = "1"
 
     def run(self) -> None:
-        # Decide whether to skip the compile: an explicit opt-in, or
-        # ``SKIP_WDNAV_VIDEO_BUILD`` already set in the environment (e.g.
-        # by a CI step that pre-built the .so), wins. Otherwise
-        # always recompile when the .so is missing or any of the
-        # source files are newer than the .so.
+        # Decide whether to compile. An explicit opt-in to skip
+        # (``--skip-wdnav-video-build`` CLI flag or
+        # ``SKIP_WDNAV_VIDEO_BUILD=1`` env var, e.g. CI pre-built the
+        # .so) wins. Otherwise v0.3.1: delete the pre-existing
+        # ``libshim_video.so`` first and unconditionally recompile
+        # — the old mtime-only check missed the case where Python
+        # wrappers (``mpp.py`` / ``rga.py`` / ``video.py`` /
+        # ``encoder.py``) added a new ``_lib.rkv_xxx.argtypes``
+        # binding without the C sources changing, leaving a stale
+        # ``.so`` that ``import wdnav`` would crash on with
+        # ``AttributeError: undefined symbol``. Cost is bounded by
+        # the two-file gcc compile (~5s on this dev box) — much
+        # cheaper than wdndds's cmake build (~20s) because there is
+        # no cmake configure / link dependency on FastDDS.
         if not self.skip_rkv_video_build and os.environ.get("SKIP_WDNAV_VIDEO_BUILD") != "1":
-            src_mtime = max(os.path.getmtime(p) for p in _C_SOURCES)
-            needs_rebuild = (
-                not os.path.exists(_OUTPUT_SO)
-                or os.path.getmtime(_OUTPUT_SO) < src_mtime
-            )
-            if needs_rebuild:
-                compile_shim(verbose=self.verbose)
-            elif self.verbose:
+            if os.path.exists(_OUTPUT_SO) or os.path.islink(_OUTPUT_SO):
+                os.unlink(_OUTPUT_SO)
                 sys.stderr.write(
-                    f"build_rkv: {_OUTPUT_SO} is up to date, "
-                    f"skipping compile\n"
-                )
+                    f"[wdnav] removed pre-existing {_OUTPUT_SO} "
+                    f"(unconditional rebuild since v0.3.1)\n")
+            compile_shim(verbose=self.verbose)
+        elif self.verbose:
+            sys.stderr.write(
+                f"build_rkv: SKIP_WDNAV_VIDEO_BUILD is set, "
+                f"leaving {_OUTPUT_SO} untouched\n"
+            )
 
         # Defer to the standard build_py so Python sources, package
         # data, and the freshly compiled .so all get copied into
