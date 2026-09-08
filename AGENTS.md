@@ -48,6 +48,18 @@ MPP / RGA / V4L2 / DmaHeap / GPU Python binding (import name `wdnav`, distributi
 - 除非要给cv2使用，否则不是用BGR格式保存，硬件编解码对NV12更加友好
 - 编码除jpeg用FIXQP模式外，其余都用CBR
 
+### 修改守则
+
+改动某个功能的时候，不影响其它功能；如果需要改动到公共功能，需要自动
+跑真实测试每个关联的功能项是否都正常。
+
+- 改动只触及目标功能及其直接依赖，不顺手 refactor 无关代码。
+- 公共功能改动（`mpp.py` / `rga.py` / `encoder.py` 等被多个调用方
+  共享的模块、native `.so` 的 ctypes 绑定）必须跑所有关联功能的真实
+  测试（`samples/` 里用该模块的样例、`tests/test_smoke.py`、调用方
+  集成路径），不允许"测试跳过"或"代码改对了就行"。
+- 失败 → 修到全通过再交。
+
 ### 视频解码
 
 ```python
