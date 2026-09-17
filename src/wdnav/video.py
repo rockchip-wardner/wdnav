@@ -574,25 +574,55 @@ class VideoCapture:
             data = bytes(raw_packet)
             if not data:
                 continue
+
+            # BACKPRESSURE FIX (wdnwebui 2026-09): drain FIRST so mpp's
+            # output buffer pool has a free slot before we push the next
+            # input packet. Without this, a TCP burst (PyAV demux
+            # returns 30+ packets back-to-back) fills mpp's input
+            # packet queue before any frame can be drained, and
+            # send_packet starts raising BUFFER_FULL — triggering the
+            # C shim's 100-retry exponential-backoff cascade
+            # (RKV_DEC_RETRY_MAX=100, 1-50ms backoff, ~5s wall time)
+            # which is exactly what the timing probe sees as 600-800ms
+            # per read0. With drain-first, the output pool has space
+            # before each push so the input queue stays bounded.
+            frame = self._drain_one_raw(
+                timeout_ms=5,
+                out_w=out_w, out_h=out_h, out_fmt=out_fmt,
+            )
+
             if not self._send(
                 data, pts=int(raw_packet.pts or raw_packet.dts or 0),
                 out_w=out_w, out_h=out_h, out_fmt=out_fmt,
             ):
+                # Real send failure (EOF on file source, or fatal
+                # mpp error). Don't conflate this with "drain timed
+                # out" — only the former should terminate read0.
                 return False, None
 
-            frame = self._drain_one_raw(out_w=out_w, out_h=out_h, out_fmt=out_fmt)
             if frame is not None:
-                # Return the MPP MppFrame handle to MPP's internal pool
-                # immediately — the fd / ptr / size fields on the frame
-                # remain valid (the DMA-BUF is owned by the kernel-side
-                # buffer group), so the caller can still feed them to
-                # RGA / encoder / display. Without this release the
-                # MPP buffer pool (24 entries by default) fills up and
-                # the next send_packet starts raising BUFFER_FULL.
+                # Return the frame we drained (1 frame behind the
+                # packet we just sent — normal for live RTSP, the
+                # consumer never notices). Releasing before return
+                # lets mpp reuse the slot for the next decode.
                 self._decoder.release_frame(frame)
                 frame.out_w, frame.out_h, frame.out_fmt = out_w, out_h, out_fmt
                 self.frame_pos += 1
                 return True, frame
+
+            # Drain timed out — no frame ready yet (mpp still
+            # decoding the packet we just sent, or hasn't started
+            # yet on a cold-start session). Continue the for loop:
+            # the next demux iteration will get the next packet, and
+            # we'll try to drain then. Returning False here would
+            # kill the entire decode loop (wdnwebui's _decode_loop
+            # treats any (False, None) as EOF and stops), which is
+            # what happens with the buggy first version of this patch.
+            # A tiny sleep throttles the producer rate so the next
+            # demux has time to settle.
+            import time as _t
+            _t.sleep(0.001)
+            continue
 
         if self._is_live:
             import time as _t
