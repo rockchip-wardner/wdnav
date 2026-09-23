@@ -21,9 +21,16 @@ MPP / RGA / V4L2 / DmaHeap / GPU Python binding (import name `wdnav`, distributi
 - `src/wdnav/encoder.py` — `VideoWriter` (MPP hardware H.264 + PyAV
   mp4v / mjpeg muxing; no cv2, no libx264 fallback). Also hosts the
   `wdnav+ws://` WebSocket sink (JPEG + H.264 via MPP).
-- `src/wdnav/composer.py` — `SurfaceComposer` / `Surface` (EGL +
-  Mali GLES compositor for displaying decoded frames).
-- `src/wdnav/mali.py` — Mali GPU / EGL helpers backing `SurfaceComposer`.
+- `src/wdnav/composer.py` — `SurfaceComposer` / `Surface` / `Typer`
+  (EGL + Mali GLES compositor for displaying decoded frames;
+  `Typer` extends `Surface` with freetype text rasterisation via
+  `wdnav.MaliText` and fontconfig `fc-match` font resolution).
+- `src/wdnav/cshim_mali.c` — C shim compiled to `libshim_mali.so`;
+  thin wrapper over `libmali.so` (EGL/GLES PBuffer path + DMA-BUF
+  FBO) and `libfreetype.so.6` (text rasterisation). Linked at build
+  time by `_build_wdnav.py` (`-lmali -lfreetype -I/usr/include/freetype2`).
+- `src/wdnav/mali.py` — Python ctypes wrapper over `libshim_mali.so`
+  (no direct `libmali` calls).
 - `src/wdnav/media.py` — `media-ctl` topology parser used by the
   camera-capture sample.
 - `src/wdnav/v4l2.py` — V4L2 capture helpers (the upstream

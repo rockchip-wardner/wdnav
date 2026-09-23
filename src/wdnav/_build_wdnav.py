@@ -271,6 +271,11 @@ def _build_mali_command(cc: str) -> List[str]:
       * The Khronos EGL/GLES headers (``/usr/include/EGL/``,
         ``/usr/include/GLES3/``) live in gcc's default search path on
         Debian aarch64, so we don't need ``-I``.
+      * freetype headers live in ``/usr/include/freetype2`` (Debian's
+        ``libfreetype-dev``); ``ft2build.h`` and ``freetype/*.h`` need
+        that on the include path. The c-shim's ``rkm_text_*`` block calls
+        ``FT_Init_FreeType`` etc., so we also link ``-lfreetype`` so
+        ``libfreetype.so.6`` becomes a DT_NEEDED entry.
       * Links against ``-lmali`` so DT_NEEDED auto-loads ``libmali.so``
         at runtime. ``libmali.so.1.9.0`` (Valhall g610) is installed by
         ``libmali-valhall-g610-g24p0-x11-wayland-gbm`` and symlinked to
@@ -288,11 +293,13 @@ def _build_mali_command(cc: str) -> List[str]:
         "-O2",
         "-Wall",
         "-Wextra",
+        "-I/usr/include/freetype2",
     ]
     cmd += list(_MALI_C_SOURCES)
     cmd += [
         "-o", _MALI_OUTPUT_SO,
         "-lmali",
+        "-lfreetype",
     ]
     if os.path.isdir(mpp_lib):
         cmd += [f"-Wl,-rpath,{mpp_lib}"]

@@ -12,10 +12,28 @@
 
 ### Native `.so` libraries
 
-**Native libraries are not vendored in this repo** — `librockchip_mpp.so.0`,
-`librga.so.2`, `libmali.so`, etc. must be installed at the system level
-(apt / dnf / prebuilt deb), typically under `/usr/lib/` and similar system dirs.
-`wdnav` resolves them via `ctypes.util.find_library` + `dlopen` on the system path.
+**Native libraries are not vendored in this repo** and must be installed at the
+system level (apt / dnf / prebuilt deb), typically under `/usr/lib/` and
+similar system dirs. `wdnav` resolves them via `ctypes.util.find_library` +
+`dlopen` on the system path, or links them into the C shims at build time.
+
+| Library | Required for | Debian / Ubuntu package |
+|---|---|---|
+| `librockchip_mpp.so.0` | `VideoCapture` / `VideoWriter` HW decode + encode | `librockchip-mpp1` |
+| `librga.so.2` | RGA2 colour-convert / resize in `VideoCapture.read(w, h)` | `librga2` |
+| `libmali.so` (`libmali-valhall-g610-g24p0-x11-wayland-gbm`) | `SurfaceComposer` / `Typer` offscreen GLES — pulled in by `libshim_mali.so`'s DT_NEEDED | `libmali-valhall-g610-g24p0-x11-wayland-gbm` |
+| `libfreetype.so.6` | `Typer` (Surface subclass) text rasterisation — c-shim calls `FT_Init_FreeType` etc. from `rkm_text_*` | `libfreetype-dev` (provides both `libfreetype.so.6` + `/usr/include/freetype2/{ft2build.h,freetype/}`) |
+| `libfontconfig` + `fc-match` CLI | `Typer(font=...)` font-family / pattern resolution (e.g. `"sans"`, `"wqy-zenhei"`, `"DejaVu Serif"`) | `fontconfig` |
+| `libv4l2.so.0` | `MediaDevice` / `v4l2.py` helpers (only if you open `/dev/video*`) | `libv4l2-dev` |
+
+`libmali.so` and `libfreetype.so.6` are linked into `libshim_mali.so` at build
+time (`-lmali -lfreetype`); the loader resolves them through the system path
+or via the `-Wl,-rpath` recorded in the .so. Headers must be present at
+build time — `libfreetype-dev` for `/usr/include/freetype2/ft2build.h`,
+Khronos EGL/GLES headers (`libecg-dev`, `libgles2-mesa-dev`) for
+`/usr/include/EGL/`, `/usr/include/GLES3/`.
+
+For the CJK font in the Typer demo (`"wqy-zenhei"`) install `fonts-wqy-zenhei`.
 
 ### External wheels
 
