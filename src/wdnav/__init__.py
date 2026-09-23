@@ -1,8 +1,8 @@
 """wdnav —— Python 入口。
 
-公开 API 全部从 ``mali`` / ``surfaceflinger`` / ``video`` / ``media`` /
+公开 API 全部从 ``mali`` / ``SurfaceComposer`` / ``video`` / ``media`` /
 ``dmaheap`` 透传过来；用户 ``import wdnav`` 后能直接拿到 ``VideoCapture``、
-``MediaDevice``、``SurfaceFlinger``、``Surface``、``DmaHeap``、
+``MediaDevice``、``SurfaceComposer``、``Surface``、``DmaHeap``、
 ``WdnavDmaBuf``、版本号等。
 """
 from __future__ import absolute_import, division, print_function
@@ -31,15 +31,16 @@ except Exception:  # pragma: no cover - missing media-ctl or parse failure
     MediaLink = None    # type: ignore[assignment]
     MediaPad = None     # type: ignore[assignment]
 
-# ``SurfaceFlinger`` 需要 ``libmali.so`` 和一个可用的 EGL display。
+# ``SurfaceComposer`` 需要 ``libmali.so`` 和一个可用的 EGL display。
 # 在没装 Mali 驱动或没有可绑定 display 的环境上，相应的 import 会抛
 # ``OSError`` 或 ``RuntimeError``；这里同样兜底为 None，保持
 # ``import wdnav`` 在开发机上不崩。
 try:
-    from .surfaceflinger import SurfaceFlinger, Surface
+    from .composer import SurfaceComposer, Surface, Typer
 except Exception:  # pragma: no cover - libmali.so missing or EGL init failed
-    SurfaceFlinger = None  # type: ignore[assignment]
-    Surface = None        # type: ignore[assignment]
+    SurfaceComposer = None  # type: ignore[assignment]
+    Surface = None   # type: ignore[assignment]
+    Typer = None     # type: ignore[assignment]
 
 # ``DmaHeap`` 需要内核启用 ``CONFIG_DMABUF_HEAPS``，并且至少有
 # ``/dev/dma_heap/<name>`` 节点；没有 dma-heap 设备的开发机 / 容器环境
@@ -83,8 +84,9 @@ __all__ = [
     "MediaEntity",
     "MediaLink",
     "MediaPad",
-    "SurfaceFlinger",
+    "SurfaceComposer",
     "Surface",
+    "Typer",
     "DmaHeap",
     "DmaBuf",
     "DmaHeapError",

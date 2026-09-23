@@ -8,7 +8,7 @@ writes a checkerboard into it via mmap, and reports what we got back.
 The interesting follow-on is to wrap the fd with
 ``wdnav.mali.create_image_dma_buf`` (matching the layout in
 ``/userdata/rbs/frameworks/glengine/buffer_gl_image.cpp``) so the
-SurfaceFlinger worker can composite it on the GPU.
+SurfaceComposer worker can composite it on the GPU.
 
     python samples/dmaheap_demo.py [heap-name] [size]
 """

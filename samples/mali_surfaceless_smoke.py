@@ -1,4 +1,4 @@
-"""Pure-GL smoke test for wdnav.SurfaceFlinger.
+"""Pure-GL smoke test for wdnav.SurfaceComposer.
 
 Verifies the surfaceless EGL context + FBO + PBO + shader path end-to-end
 without involving VideoCapture. Useful for debugging compositor issues in
@@ -25,8 +25,8 @@ import wdnav
 
 def main() -> int:
     out_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/rkv_surfaceless_smoke.png"
-    if wdnav.SurfaceFlinger is None:
-        print("libmali not loadable; SurfaceFlinger is None", file=sys.stderr)
+    if wdnav.SurfaceComposer is None:
+        print("libmali not loadable; SurfaceComposer is None", file=sys.stderr)
         return 1
 
     if wdnav.DmaHeap is not None:
@@ -38,7 +38,7 @@ def main() -> int:
     else:
         print("/dev/dma_heap not present on this system", file=sys.stderr)
 
-    sf = wdnav.SurfaceFlinger(w=640, h=480)
+    sf = wdnav.SurfaceComposer(w=640, h=480)
     s = sf.create_surface(0, 0, 640, 480, zpos=0, fmt="BGR888")
 
     buf = s.latest_ndarray

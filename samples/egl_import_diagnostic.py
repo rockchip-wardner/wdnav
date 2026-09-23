@@ -7,7 +7,7 @@ DMA-BUF fd allocated via ``/dev/dma_heap/system`` (modern kernel) or
 ``/dev/dri/card0`` (legacy Rockchip kernel). If every format returns
 ``EGL_BAD_PARAMETER (0x3009)``, the libmali build on this machine
 fundamentally does not honour ``EGL_EXT_image_dma_buf_import`` for
-fds the user can actually allocate — the SurfaceFlinger compositor
+fds the user can actually allocate — the SurfaceComposer compositor
 must fall back to the BGR software upload path.
 
 Run on any target board to triage whether DMA-BUF zero-copy is usable:

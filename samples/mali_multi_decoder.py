@@ -1,8 +1,8 @@
-"""2x2 hardware decode + GPU composition via wdnav.SurfaceFlinger.
+"""2x2 hardware decode + GPU composition via wdnav.SurfaceComposer.
 
 Four input files, each on its own decode thread + its own
 :class:`wdnav.VideoCapture` + its own :class:`wdnav.Surface` on a 2x2 grid in
-a single :class:`wdnav.SurfaceFlinger`. The main thread just calls
+a single :class:`wdnav.SurfaceComposer`. The main thread just calls
 ``sf.read()`` once per loop iteration; the per-frame composition is GPU.
 
 Same per-stream pacing as :file:`multi_decoder.py`, but the grid layer
@@ -130,7 +130,7 @@ def main(args: argparse.Namespace) -> int:
         return 1
     cell_w, cell_h = grid_w // 2, grid_h // 2
 
-    sf = wdnav.SurfaceFlinger(w=grid_w, h=grid_h)
+    sf = wdnav.SurfaceComposer(w=grid_w, h=grid_h)
     surfaces = [
         sf.create_surface(
             (i % 2) * cell_w, (i // 2) * cell_h,
@@ -200,7 +200,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Decode 4 video files in parallel and composite them on the GPU "
-            "via wdnav.SurfaceFlinger."
+            "via wdnav.SurfaceComposer."
         ),
     )
     p.add_argument(

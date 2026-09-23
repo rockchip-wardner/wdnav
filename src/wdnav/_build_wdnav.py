@@ -88,6 +88,14 @@ _C_SOURCES = (
 _OUTPUT_DIR = os.path.join(_THIS_DIR, "lib")
 _OUTPUT_SO = os.path.join(_OUTPUT_DIR, "libshim_video.so")
 
+# Mali (EGL + GLES) c-shim — built into its own .so so it links against
+# libmali.so instead of librockchip_mpp.so. Compiled from
+# ``src/wdnav/cshim_mali.c``; loaded at runtime by ``wdnav.mali``.
+_MALI_C_SOURCES = (
+    os.path.join(_THIS_DIR, "cshim_mali.c"),
+)
+_MALI_OUTPUT_SO = os.path.join(_OUTPUT_DIR, "libshim_mali.so")
+
 
 def _resolve_mpp_inc() -> str:
     """Pick the Rockchip MPP public-header directory.
@@ -255,6 +263,99 @@ def compile_shim(verbose: bool = False) -> None:
         )
 
 
+def _build_mali_command(cc: str) -> List[str]:
+    """Assemble the gcc command line for the Mali shim.
+
+    Same flags as ``_build_command`` but:
+
+      * The Khronos EGL/GLES headers (``/usr/include/EGL/``,
+        ``/usr/include/GLES3/``) live in gcc's default search path on
+        Debian aarch64, so we don't need ``-I``.
+      * Links against ``-lmali`` so DT_NEEDED auto-loads ``libmali.so``
+        at runtime. ``libmali.so.1.9.0`` (Valhall g610) is installed by
+        ``libmali-valhall-g610-g24p0-x11-wayland-gbm`` and symlinked to
+        ``/usr/lib/aarch64-linux-gnu/libmali.so`` — gcc resolves that
+        symlink at link time.
+      * Adds ``-Wl,-rpath,<mpp_lib>`` so the .so locates ``libmali.so``
+        on hosts where it isn't in ``ldconfig`` (mirrors the MPP shim's
+        rpath handling).
+    """
+    mpp_lib = os.environ.get("WDNAV_MPP_LIB", _DEFAULT_MPP_LIB)
+    cmd: List[str] = [
+        cc,
+        "-shared",
+        "-fPIC",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+    ]
+    cmd += list(_MALI_C_SOURCES)
+    cmd += [
+        "-o", _MALI_OUTPUT_SO,
+        "-lmali",
+    ]
+    if os.path.isdir(mpp_lib):
+        cmd += [f"-Wl,-rpath,{mpp_lib}"]
+    return cmd
+
+
+def compile_mali_shim(verbose: bool = False) -> None:
+    """Compile ``cshim_mali.c`` into ``src/wdnav/lib/libshim_mali.so``.
+
+    Skipped when ``SKIP_WDNAV_MALI_BUILD=1`` is set (independent of the
+    video-shim skip flag, so a host without ``libmali.so`` can still
+    build ``libshim_video.so`` only).
+
+    Raises :class:`RuntimeError` on compile failure, including the full
+    gcc command line + stderr so the cause is obvious without re-running.
+    """
+    if os.environ.get("SKIP_WDNAV_MALI_BUILD") == "1":
+        sys.stderr.write(
+            "build_rkv: SKIP_WDNAV_MALI_BUILD=1, leaving "
+            f"{_MALI_OUTPUT_SO} as-is (shim may be stale)\n"
+        )
+        return
+
+    cc = _resolve_cc()
+    if shutil.which(cc) is None:
+        raise RuntimeError(
+            f"build_rkv: C compiler {cc!r} not found on PATH; install "
+            f"gcc or set CC=/path/to/cc"
+        )
+
+    cmd = _build_mali_command(cc)
+    if verbose:
+        sys.stderr.write(
+            "build_rkv: compiling Mali C shim: " + " ".join(cmd) + "\n"
+        )
+
+    os.makedirs(_OUTPUT_DIR, exist_ok=True)
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as e:
+        raise RuntimeError(
+            f"build_rkv: failed to invoke C compiler {cc!r}: {e}"
+        ) from e
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "build_rkv: libshim_mali.so failed to compile.\n"
+            f"  command: {' '.join(cmd)}\n"
+            f"  gcc stderr:\n{proc.stderr.decode('utf-8', 'replace')}"
+        )
+
+    if not os.path.exists(_MALI_OUTPUT_SO):
+        raise RuntimeError(
+            f"build_rkv: compile reported success but {_MALI_OUTPUT_SO} "
+            f"is missing; check {cc}'s -o handling"
+        )
+
+
 # ---------------------------------------------------------------------------
 # setuptools cmdclass integration
 # ---------------------------------------------------------------------------
@@ -288,17 +389,22 @@ class build_py(_build_py):
 
     user_options = _build_py.user_options + [
         ("skip-wdnav-video-build", None,
-         "Skip the C shim compile (sets SKIP_WDNAV_VIDEO_BUILD=1)."),
+         "Skip the video C shim compile (sets SKIP_WDNAV_VIDEO_BUILD=1)."),
+        ("skip-wdnav-mali-build", None,
+         "Skip the Mali C shim compile (sets SKIP_WDNAV_MALI_BUILD=1)."),
     ]
 
     def initialize_options(self) -> None:
         super().initialize_options()
         self.skip_rkv_video_build: bool = False
+        self.skip_rkv_mali_build: bool = False
 
     def finalize_options(self) -> None:
         super().finalize_options()
         if self.skip_rkv_video_build:
             os.environ["SKIP_WDNAV_VIDEO_BUILD"] = "1"
+        if self.skip_rkv_mali_build:
+            os.environ["SKIP_WDNAV_MALI_BUILD"] = "1"
 
     def run(self) -> None:
         # Decide whether to compile. An explicit opt-in to skip
@@ -326,6 +432,22 @@ class build_py(_build_py):
             sys.stderr.write(
                 f"build_rkv: SKIP_WDNAV_VIDEO_BUILD is set, "
                 f"leaving {_OUTPUT_SO} untouched\n"
+            )
+
+        # Same unconditional rebuild for libshim_mali.so - see the v0.3.1
+        # rationale above. Independent skip flag so a host without
+        # libmali.so can still build libshim_video.so only.
+        if not self.skip_rkv_mali_build and os.environ.get("SKIP_WDNAV_MALI_BUILD") != "1":
+            if os.path.exists(_MALI_OUTPUT_SO) or os.path.islink(_MALI_OUTPUT_SO):
+                os.unlink(_MALI_OUTPUT_SO)
+                sys.stderr.write(
+                    f"[wdnav] removed pre-existing {_MALI_OUTPUT_SO} "
+                    f"(unconditional rebuild)\n")
+            compile_mali_shim(verbose=self.verbose)
+        elif self.verbose:
+            sys.stderr.write(
+                f"build_rkv: SKIP_WDNAV_MALI_BUILD is set, "
+                f"leaving {_MALI_OUTPUT_SO} untouched\n"
             )
 
         # Defer to the standard build_py so Python sources, package

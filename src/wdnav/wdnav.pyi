@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """类型 stub —— 给 IDE / mypy 看，运行时不会被 import。"""
 
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
@@ -170,7 +170,7 @@ class VideoWriter:
     def __exit__(self, *exc) -> None: ...
 
 
-class SurfaceFlinger:
+class SurfaceComposer:
     def __init__(
         self,
         w: int,
@@ -192,8 +192,22 @@ class SurfaceFlinger:
     ) -> "Surface": ...
     def read(self, *, timeout: Optional[float] = ...) -> np.ndarray: ...
     def close(self) -> None: ...
-    def __enter__(self) -> "SurfaceFlinger": ...
+    def __enter__(self) -> "SurfaceComposer": ...
     def __exit__(self, *exc) -> None: ...
+
+    def create_typer(
+        self,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+        *,
+        zpos: int = ...,
+        font: Optional[str] = ...,
+        size: int = ...,
+        color: Tuple[int, int, int] = ...,
+        bg_color: Optional[Tuple[int, int, int]] = ...,
+    ) -> "Typer": ...
 
 
 class Surface:
@@ -210,6 +224,28 @@ class Surface:
     def post(self, pts: int = ...) -> None: ...
     @property
     def latest_ndarray(self) -> np.ndarray: ...
+
+
+class Typer(Surface):
+    @property
+    def font_path(self) -> str: ...
+    def text(
+        self,
+        s: str,
+        xy: Tuple[int, int],
+        *,
+        size: Optional[int] = ...,
+        color: Optional[Tuple[int, int, int]] = ...,
+        font: Optional[str] = ...,
+        bg_color: Optional[Tuple[int, int, int]] = ...,
+    ) -> Tuple[int, int]: ...
+    def textsize(
+        self,
+        s: str,
+        *,
+        size: Optional[int] = ...,
+        font: Optional[str] = ...,
+    ) -> Tuple[int, int]: ...
 
 
 class DmaHeap:

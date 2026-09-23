@@ -1,4 +1,4 @@
-"""Single-stream demo: wdnav.VideoCapture -> wdnav.SurfaceFlinger -> cv2.imshow.
+"""Single-stream demo: wdnav.VideoCapture -> wdnav.SurfaceComposer -> cv2.imshow.
 
 Demonstrates the compositor with two stacked surfaces:
 
@@ -38,7 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Open a local file or a network stream with wdnav.VideoCapture, "
-            "feed it into a wdnav.SurfaceFlinger, and show the composited result."
+            "feed it into a wdnav.SurfaceComposer, and show the composited result."
         ),
     )
     parser.add_argument(
@@ -87,7 +87,7 @@ def main(args) -> int:
         return 1
     print(f"opened {args.path}: {cap.width}x{cap.height} @ {cap.fps:.2f} fps")
 
-    sf = wdnav.SurfaceFlinger(w=args.width, h=args.height)
+    sf = wdnav.SurfaceComposer(w=args.width, h=args.height)
     if args.zero_copy:
         plan1 = sf.create_surface(0, 0, args.width, args.height, zpos=0, fmt="NV12")
     else:
@@ -95,8 +95,8 @@ def main(args) -> int:
     osd_h = max(48, args.height // 8)
     plan2 = sf.create_surface(0, 0, args.width, osd_h, zpos=1, fmt="BGR888")
 
-    cv2.namedWindow("wdnav SurfaceFlinger", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("wdnav SurfaceFlinger", min(args.width, 1280), min(args.height, 720))
+    cv2.namedWindow("wdnav SurfaceComposer", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("wdnav SurfaceComposer", min(args.width, 1280), min(args.height, 720))
 
     while True:
         if args.zero_copy:
@@ -116,7 +116,7 @@ def main(args) -> int:
         osd[:] = (32, 32, 32)
         cv2.putText(
             osd,
-            f"wdnav SurfaceFlinger x Mali-G610  frame {cap.frame_pos}",
+            f"wdnav SurfaceComposer x Mali-G610  frame {cap.frame_pos}",
             (16, max(20, osd_h - 12)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -127,7 +127,7 @@ def main(args) -> int:
         plan2.post(pts=cap.frame_pos)
 
         img = sf.read()
-        cv2.imshow("wdnav SurfaceFlinger", img)
+        cv2.imshow("wdnav SurfaceComposer", img)
         if cv2.waitKey(25) & 0xFF == ord("q"):
             break
         if args.max_frames and cap.frame_pos >= args.max_frames:
