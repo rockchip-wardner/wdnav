@@ -591,8 +591,17 @@ class VideoCapture:
                 out_w=out_w, out_h=out_h, out_fmt=out_fmt,
             )
 
+            # pts==0 is valid (H.264 IDR with B-frame reorder); use
+            # ``is not None`` to avoid the `or` falsy trap that previously
+            # surfaced the I-frame with pts=dts (<0).
+            if raw_packet.pts is not None:
+                send_pts = int(raw_packet.pts)
+            elif raw_packet.dts is not None:
+                send_pts = int(raw_packet.dts)
+            else:
+                send_pts = 0
             if not self._send(
-                data, pts=int(raw_packet.pts or raw_packet.dts or 0),
+                data, pts=send_pts,
                 out_w=out_w, out_h=out_h, out_fmt=out_fmt,
             ):
                 # Real send failure (EOF on file source, or fatal
@@ -601,12 +610,16 @@ class VideoCapture:
                 return False, None
 
             if frame is not None:
-                # Return the frame we drained (1 frame behind the
-                # packet we just sent — normal for live RTSP, the
-                # consumer never notices). Releasing before return
-                # lets mpp reuse the slot for the next decode.
-                self._decoder.release_frame(frame)
+                # Set out_w/h/fmt BEFORE numpy() so the cache is built
+                # with the same args the caller will pass later. The
+                # cached ndarray owns its buf_storage — MPP can safely
+                # reuse the DMA-BUF fd after release_frame.
                 frame.out_w, frame.out_h, frame.out_fmt = out_w, out_h, out_fmt
+                try:
+                    frame._cached_bgr = frame.numpy()
+                except Exception:
+                    frame._cached_bgr = None
+                self._decoder.release_frame(frame)
                 self.frame_pos += 1
                 return True, frame
 

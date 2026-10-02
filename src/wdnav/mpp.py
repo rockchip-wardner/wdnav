@@ -497,6 +497,13 @@ class DecodedFrame:
 
     def numpy(self, w=None, h=None, fmt=None):
         """Materialise this frame into a contiguous ndarray via RGA2."""
+        # If read0() cached the BGR before releasing the DMA-BUF, return
+        # that cached ndarray instead of re-reading the (possibly reused
+        # by now) DMA-BUF. See video.py:read0() for the rationale.
+        cached = getattr(self, "_cached_bgr", None)
+        if cached is not None:
+            return cached
+
         import ctypes
 
         from . import rga
