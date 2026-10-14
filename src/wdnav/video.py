@@ -35,7 +35,7 @@ from __future__ import annotations
 import ctypes
 import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import av
 import numpy as np
@@ -555,6 +555,27 @@ class VideoCapture:
         V4L2 path runs the RGA conversion without going through
         :meth:`DecodedFrame.numpy`.
         """
+        return self._read0(w, h, fmt, None)
+
+    def read0_multi(
+        self,
+        sizes: Sequence[Tuple[int, int]],
+    ) -> Tuple[bool, Optional[List]]:
+        """Same as :meth:`read0` but emits the frame at several sizes.
+
+        ``read0`` hard-codes one output size, so a consumer needing the
+        same frame at two scales (a small JPEG for the browser plus a
+        larger one for a vision model) would have to decode twice or
+        re-sample already-scaled pixels (which loses information). Both
+        are avoidable — the DMA-BUF stays valid until ``release_frame``.
+
+        Returns ``(ok, frames)``; ``frames`` is a list of ndarray in the
+        same order as *sizes*, each owning its backing storage so it
+        outlives the DMA-BUF.
+        """
+        return self._read0(None, None, None, list(sizes))
+
+    def _read0(self, w, h, fmt, multi_sizes):
         if not self._opened or self._eof:
             return False, None
 
@@ -610,15 +631,7 @@ class VideoCapture:
                 return False, None
 
             if frame is not None:
-                # Set out_w/h/fmt BEFORE numpy() so the cache is built
-                # with the same args the caller will pass later. The
-                # cached ndarray owns its buf_storage — MPP can safely
-                # reuse the DMA-BUF fd after release_frame.
-                frame.out_w, frame.out_h, frame.out_fmt = out_w, out_h, out_fmt
-                try:
-                    frame._cached_bgr = frame.numpy()
-                except Exception:
-                    frame._cached_bgr = None
+                self._materialize(frame, out_w, out_h, out_fmt, multi_sizes)
                 self._decoder.release_frame(frame)
                 self.frame_pos += 1
                 return True, frame
@@ -647,14 +660,32 @@ class VideoCapture:
         while idle < 10:
             frame = self._recv_raw(timeout_ms=50)
             if frame is not None:
+                self._materialize(frame, out_w, out_h, out_fmt, multi_sizes)
                 self._decoder.release_frame(frame)
-                frame.out_w, frame.out_h, frame.out_fmt = out_w, out_h, out_fmt
                 self.frame_pos += 1
                 return True, frame
             idle += 1
 
         self._eof = True
         return False, None
+
+    @staticmethod
+    def _materialize(frame, out_w, out_h, out_fmt, multi_sizes) -> None:
+        """RGA ``frame`` into one ndarray per requested size, in place.
+
+        Must run **before** ``release_frame`` — that is what keeps the
+        DMA-BUF readable. ``_cached_bgr`` is left unset on the multi path
+        so ``numpy()`` doesn't short-circuit on the 2nd call.
+        """
+        frame.out_w, frame.out_h, frame.out_fmt = out_w, out_h, out_fmt
+        try:
+            if multi_sizes:
+                frame._multi_bgr = [frame.numpy(w, h) for w, h in multi_sizes]
+            else:
+                frame._cached_bgr = frame.numpy()
+        except Exception:
+            frame._multi_bgr = None
+            frame._cached_bgr = None
 
     def release(self) -> None:
         if not self._opened:
