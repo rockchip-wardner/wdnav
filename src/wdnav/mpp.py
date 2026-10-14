@@ -1112,10 +1112,35 @@ class MppDecoder:
         if self._closed or self._handle is None:
             self._closed = True
             return
-        self._closed = True
         with _mpp_lock:
+            # 先排空再 destroy。读完 N 帧就 release() 是常态，此时硬件解码
+            # 任务手上还挂着 in-flight 的 MppBuffer，直接 destroy 会让
+            # buf_group 的 deinit 撞上 ref_count != 0 而放弃归还，DMA-BUF fd
+            # 就永久漏在进程里。送空 EOS packet 让 VPU 把 pipeline 吐干净，
+            # 连续 5 次取不到才算排空，最多试 3 轮。
+            # 全程 best-effort：drain 失败不该阻止 destroy，否则把「资源
+            # 泄漏」升级成「close 抛异常」。
+            err_buf = ctypes.create_string_buffer(512)
+            out = _RkvDecFrame()
+            for _ in range(3):
+                if _lib.rkv_dec_put_packet(
+                    self._handle, None, 0, 0, 1, err_buf, 512,
+                ) != 0:
+                    break
+                misses = 0
+                while misses < 5:
+                    if _lib.rkv_dec_get_frame(
+                        self._handle, 30, byref(out), err_buf, 512,
+                    ) != 1:
+                        misses += 1
+                        continue
+                    _lib.rkv_dec_release_frame(self._handle, err_buf, 512)
+                    misses = 0
+                if misses >= 5:
+                    break  # 已排空，不必再送 EOS
             _lib.rkv_dec_destroy(self._handle)
         self._handle = None
+        self._closed = True
 
     def send_packet(self, data: bytes, pts: int = 0, eos: bool = False) -> None:
         """Submit one packet to the decoder."""

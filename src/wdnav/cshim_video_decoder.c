@@ -559,13 +559,18 @@ void rkv_dec_destroy(rkv_decoder_t *dec) {
         dec->packet_buf = NULL;
         dec->packet_buf_size = 0;
     }
-    if (dec->buf_group) {
-        mpp_buffer_group_put(dec->buf_group);
-        dec->buf_group = NULL;
-    }
+    /* ctx 必须先于 buf_group 销毁：调用方读完若干帧就 release() 时，
+     * 硬件解码任务（try_proc_dec_task）手上还挂着 in-flight 帧，group
+     * 引用非零。先 put(group) 会触发 deinit 撞上 ref_count != 0 而放弃
+     * 归还，DMA-BUF fd 就永久漏在进程里。先 mpp_destroy 让任务停下、
+     * 把 buffer 还回 group，group 才能干净 deinit。 */
     if (dec->ctx) {
         mpp_destroy(dec->ctx);
         dec->ctx = NULL;
+    }
+    if (dec->buf_group) {
+        mpp_buffer_group_put(dec->buf_group);
+        dec->buf_group = NULL;
     }
     dec->closed = RK_TRUE;
     free(dec);
