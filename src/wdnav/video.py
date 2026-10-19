@@ -611,6 +611,18 @@ class VideoCapture:
                 timeout_ms=5,
                 out_w=out_w, out_h=out_h, out_fmt=out_fmt,
             )
+            # Materialise + release BEFORE ``_send``. ``_send`` may hit
+            # BUFFER_FULL and pull another frame to make room, but MPP's
+            # decoder refuses a second ``recv_frame`` while a frame is
+            # still held (``rkv_dec_get_frame`` returns -1 with
+            # "previous frame not released"). Holding this one across
+            # the send therefore turns a routine backpressure event —
+            # the very case this drain-first loop exists to handle —
+            # into a fatal ``read()`` error. ``numpy()`` afterwards is
+            # served from the cached ndarray ``_materialize`` left.
+            if frame is not None:
+                self._materialize(frame, out_w, out_h, out_fmt, multi_sizes)
+                self._decoder.release_frame(frame)
 
             # pts==0 is valid (H.264 IDR with B-frame reorder); use
             # ``is not None`` to avoid the `or` falsy trap that previously
@@ -631,8 +643,6 @@ class VideoCapture:
                 return False, None
 
             if frame is not None:
-                self._materialize(frame, out_w, out_h, out_fmt, multi_sizes)
-                self._decoder.release_frame(frame)
                 self.frame_pos += 1
                 return True, frame
 
@@ -946,6 +956,15 @@ class VideoCapture:
                 out, self._prefetched = self._prefetched, None
                 self._prefetched_args = None
                 return out
+            # Overrides changed — the stashed frame's RGA conversion no
+            # longer matches. Drop it, but release it back to MPP first:
+            # leaking it would leave the decoder holding a frame, and the
+            # next recv_frame would then fail with "previous frame not
+            # released" — the exact failure this cache is meant to avoid.
+            try:
+                self._decoder.release_frame(self._prefetched)
+            except Exception:
+                pass
             self._prefetched = None
             self._prefetched_args = None
         return self._recv_raw(timeout_ms=timeout_ms)
