@@ -52,6 +52,14 @@
 #include <rk_venc_cfg.h>
 #include <mpp_rc_api.h>
 
+/* ``mpp_meta_inc_ref`` is exported by librockchip_mpp.so but not
+ * declared in :file:`mpp_meta.h` (it's marked internal). We use it
+ * here to keep the per-encoder meta alive across :func:`mpp_frame_deinit`
+ * calls — see the long NOTE 1 in :func:`encode_mjpeg` for the
+ * full reasoning. Forward-declare here rather than touching the
+ * upstream header. */
+extern MPP_RET mpp_meta_inc_ref(MppMeta meta);
+
 /* ---------------------------------------------------------------------------
  * Coding types — match MppCodingType values the upstream enum assigns.
  * AVC and MJPEG are simple positional enums, HEVC sits in the
@@ -85,10 +93,15 @@
 #define RKV_FMT_BGRA        (1 << 16) + 12
 #define RKV_FMT_RGBA        (1 << 16) + 13
 
-/* Output packet scratch buffer — generous default that holds a 1080p
- * access unit at high bitrate without spilling. Matches the upstream
- * test's choice. */
-#define RKV_ENC_PKT_BUF_SIZE (256 * 1024)
+/* Output packet scratch buffer. This is now only a *floor* — the real
+ * allocation is computed per-encoder by :func:`pkt_buf_size`; see the
+ * long note there for why a fixed size truncates high-entropy MJPEG. */
+#define RKV_ENC_PKT_BUF_SIZE_MIN (256 * 1024)
+
+/* MPP's own alignment macro is private to librockchip_mpp (it appears in
+ * mpp_enc_impl.c but is not exported in the public headers), so mirror it
+ * here: round ``v`` up to the next multiple of ``a`` (power of two). */
+#define RKV_ALIGN(v, a) (((v) + ((a) - 1)) & ~((size_t)(a) - 1))
 
 /* Buffer group type for the encoder's input frame buffer. The
  * upstream test uses DRM | FLAG_CACHABLE on RK3588 / RK3568 so the
@@ -311,6 +324,126 @@ static MPP_RET set_header_mode(rkv_encoder_t *enc,
     return check(ret, "MPP_ENC_SET_HEADER_MODE", err_buf, err_buf_len);
 }
 
+/* Copy a tightly-packed ``width`` x ``height`` image from ``src`` into the
+ * stride-padded encoder buffer ``dst``, zero-filling every padding byte.
+ *
+ * The Python side always hands us a densely packed buffer sized to the
+ * *visible* dimensions (mpp.py passes ``hor_stride=width``,
+ * ``ver_stride=height``), while the HAL walks the buffer in 16x16 MCU
+ * steps using ``prep:hor_stride`` / ``prep:ver_stride``. Whenever those
+ * strides exceed the visible dimensions the destination rows no longer
+ * line up with the source rows, so the copy has to be done row by row
+ * rather than as one flat ``memcpy``.
+ *
+ * When the strides equal the dimensions (the common case: 1280x720 and
+ * every other 16-aligned size) this degenerates to exactly the same
+ * bytes as the old flat ``memcpy``.
+ */
+static size_t pixel_buf_size(RK_S32 fmt, RK_S32 stride, RK_S32 height);
+
+/* Copy one plane row by row, zero-filling any destination rows past the
+ * visible height. ``src_row_bytes`` / ``dst_row_bytes`` differ for the
+ * packed formats, where ``hstride`` counts pixels rather than bytes. */
+static void copy_plane(RK_U8 *d, const RK_U8 *s,
+                       RK_S32 vis_rows, RK_S32 dst_rows,
+                       RK_S32 src_row_bytes, RK_S32 dst_row_bytes) {
+    RK_S32 r;
+    for (r = 0; r < dst_rows; r++) {
+        RK_U8 *dp = d + (size_t)r * dst_row_bytes;
+        if (r < vis_rows)
+            memcpy(dp, s + (size_t)r * src_row_bytes, (size_t)src_row_bytes);
+        else
+            memset(dp, 0, (size_t)dst_row_bytes);
+    }
+}
+
+static void copy_padded_frame(void *dst, const void *src,
+                              RK_S32 fmt,
+                              RK_S32 width, RK_S32 height,
+                              RK_S32 hstride, RK_S32 vstride) {
+    RK_U8 *d = (RK_U8 *)dst;
+    const RK_U8 *s = (const RK_U8 *)src;
+    /* Destination offset of the second plane. */
+    size_t y_plane = (size_t)hstride * (size_t)vstride;
+    size_t src_y = (size_t)width * (size_t)height;
+    size_t src_c = (size_t)width * (size_t)(height / 2);
+    RK_S32 chroma_rows = height / 2;
+
+    switch (fmt) {
+    case RKV_FMT_YUV420SP:
+    case RKV_FMT_YUV420SP_VU:
+        /* Two planes: Y (full height) + interleaved UV (half height). */
+        copy_plane(d, s, height, vstride, width, hstride);
+        copy_plane(d + y_plane, s + src_y, chroma_rows, vstride / 2, width, hstride);
+        break;
+    case RKV_FMT_YUV420P:
+        /* Three planes: Y, U, V - the last two are half height. */
+        copy_plane(d, s, height, vstride, width, hstride);
+        copy_plane(d + y_plane, s + src_y, chroma_rows, vstride / 2, width, hstride);
+        copy_plane(d + y_plane * 3 / 2, s + src_y + src_c, chroma_rows,
+                   vstride / 2, width, hstride);
+        break;
+    case RKV_FMT_BGR888:
+    case RKV_FMT_RGB888:
+        copy_plane(d, s, height, vstride, width * 3, hstride * 3);
+        break;
+    case RKV_FMT_BGRA:
+    case RKV_FMT_RGBA:
+        copy_plane(d, s, height, vstride, width * 4, hstride * 4);
+        break;
+    default:
+        /* Unknown format: preserve the old flat-copy behaviour. */
+        memcpy(dst, src, pixel_buf_size(fmt, hstride, vstride));
+        break;
+    }
+}
+
+/* Size of the encoder's output packet scratch buffer.
+ *
+ * This MUST mirror ``mpp_enc_check_pkt_buf()`` in
+ * ``mpp/codec/mpp_enc_impl.c``:
+ *
+ *     if (NULL == enc->pkt_buf) {
+ *         // NOTE: set buffer w * h * 1.5 to avoid buffer overflow
+ *         RK_U32 width  = MPP_ALIGN(prep->width, 16);
+ *         RK_U32 height = MPP_ALIGN(prep->height, 16);
+ *         RK_U32 size = (enc->coding == MPP_VIDEO_CodingMJPEG) ?
+ *                       (width * height * 3 / 2) : (width * height);
+ *         ...
+ *
+ * MPP only allocates that buffer itself when the caller has NOT bound
+ * an output packet (``enc->pkt_buf == NULL``). The MJPEG path here
+ * *must* bind a packet up front — the JPEG HAL writes the whole JPEG
+ * into the packet attached via ``KEY_OUTPUT_PACKET`` and will not ask
+ * the buffer group for one — so MPP's branch never runs and sizing the
+ * packet becomes the caller's job.
+ *
+ * Sizing it too small is a silent, memory-unsafe corruption rather than
+ * a clean error: the RK3588 JPEG EPU writes the entropy-coded stream
+ * into that buffer with no bound check, so once the encoded frame
+ * exceeds the buffer the stream is cut off mid-scan. The result is a
+ * JPEG with no trailing ``ff d9`` (EOI); libjpeg reports "premature end
+ * of data segment" and fills the un-encoded bottom MCU rows with flat
+ * grey — the classic "grey bar along the bottom of the preview".
+ *
+ * The 256 KB this used to allocate is only ~0.28 bytes/pixel at
+ * 1280x720, which a low-entropy test pattern (flat screen, gradient)
+ * never reaches but a real desktop with photos / text easily does. The
+ * 1.5 bytes/pixel that MPP asks for is ~1.32 MB at 720p and ~3.0 MB at
+ * 1080p, which is comfortable headroom for real content.
+ *
+ * The old constant is retained as a floor so no configuration (e.g. a
+ * small H.264 encode) ends up with *less* output buffer than it had
+ * before this fix.
+ */
+static size_t pkt_buf_size(const rkv_encoder_t *enc) {
+    size_t w = RKV_ALIGN((size_t)enc->width, 16);
+    size_t h = RKV_ALIGN((size_t)enc->height, 16);
+    size_t size = (enc->coding_type == RKV_CT_MJPEG) ? (w * h * 3 / 2)
+                                                     : (w * h);
+    return (size < RKV_ENC_PKT_BUF_SIZE_MIN) ? RKV_ENC_PKT_BUF_SIZE_MIN : size;
+}
+
 static MPP_RET alloc_buffers(rkv_encoder_t *enc,
                              char *err_buf, int err_buf_len) {
     MPP_RET ret = mpp_buffer_group_get(&enc->buf_group, RKV_ENC_BUF_TYPE,
@@ -329,7 +462,7 @@ static MPP_RET alloc_buffers(rkv_encoder_t *enc,
                      err_buf, err_buf_len);
 
     ret = mpp_buffer_get_with_tag(enc->buf_group, &enc->pkt_buf,
-                                  (size_t)RKV_ENC_PKT_BUF_SIZE,
+                                  pkt_buf_size(enc),
                                   RKV_TAG_MODULE, RKV_TAG_PKT);
     if (ret != MPP_OK)
         return check(ret, "mpp_buffer_get_with_tag pkt_buf",
@@ -424,9 +557,22 @@ int rkv_enc_create(
      * encoder's ``prep:hor_stride`` is locked to ``width`` and the
      * HAL reads each row at the wrong offset — visible as a striped /
      * diagonal skew in the encoded output. ``hor_stride=0`` /
-     * ``ver_stride=0`` mean "no padding, stride == dimension". */
-    enc->hor_stride    = (hor_stride > 0) ? hor_stride : width;
-    enc->ver_stride    = (ver_stride > 0) ? ver_stride : height;
+     * ``ver_stride=0`` mean "no padding, stride == dimension".
+     *
+     * Both strides are additionally rounded up to the 16x16 MCU grid.
+     * The HAL walks the input one MCU row at a time and steps by
+     * ``prep:ver_stride``, so a height that is not a multiple of 16
+     * (1920x1080 being the classic case) makes it consume a partial
+     * MCU row and emit a bitstream with **no trailing EOI marker** —
+     * a JPEG every decoder rejects with "premature end of data
+     * segment", whose un-decoded bottom MCU rows render as flat grey.
+     * Verified on RK3588: 1920x1080 at ver_stride=1080 produced a
+     * 173 KB stream ending in ``00 00``; the same frame at
+     * ver_stride=1088 produced a valid JPEG ending in ``ff d9``.
+     * :func:`copy_padded_frame` keeps the caller's tightly-packed
+     * buffer safe while the HAL-side strides carry the padding. */
+    enc->hor_stride    = (RK_S32)RKV_ALIGN((size_t)((hor_stride > 0) ? hor_stride : width), 16);
+    enc->ver_stride    = (RK_S32)RKV_ALIGN((size_t)((ver_stride > 0) ? ver_stride : height), 16);
     enc->fps           = fps;
     enc->bitrate       = bitrate;
     enc->gop           = gop;
@@ -577,13 +723,45 @@ static MPP_RET encode_h264(rkv_encoder_t *enc,
  * KEY_OUTPUT_PACKET slot. The JPEG HAL refuses to ask the buffer
  * group for a packet (it asserts in ``mpp_enc_check_pkt_buf``); the
  * caller has to provide one upfront. Packet is bound once and reused
- * across calls. */
+ * across calls.
+ *
+ * Why we still call encode_get_packet after encode_put_frame:
+ *   In :func:`encode_h264` we drain a packet right after the put
+ *   (``enc->api->encode_get_packet(enc->ctx, &enc->packet)``). For
+ *   MJPEG the equivalent step was historically omitted under the
+ *   assumption that the caller would read the pre-bound packet
+ *   (``enc->packet``) via :func:`rkv_enc_get_packet`. That works for
+ *   the data flow — the JPEG encoder fills the pre-bound packet in
+ *   place — but it leaks the MPP output-task slot.
+ *
+ *   Trace through :file:`mpp/codec/mpp_enc_impl.c` lines 2318-2319:
+ *   after every successful encode the implementation does
+ *       mpp_task_meta_set_packet(enc->task_out, KEY_OUTPUT_PACKET, enc->packet);
+ *       mpp_port_enqueue(enc->output, enc->task_out);
+ *   i.e. it always parks a task into the output port's queue. The
+ *   output port's queue is sized at ``mOutputTaskCount`` (8 on
+ *   RK3588). Without a matching ``encode_get_packet`` to dequeue
+ *   + re-enqueue, the port fills after exactly 8 encode calls;
+ *   the 9th :func:`mpp_port_enqueue` blocks indefinitely on
+ *   ``MPP_POLL_BLOCK``, manifesting as the encoder "hanging" after
+ *   ~8 frames. The :func:`wdnav.encoder` workaround was to recreate
+ *   the encoder every 6 frames (``_MPP_MJPEG_RECYCLE_EVERY``); the
+ *   real fix is the symmetric dequeue below.
+ */
 static MPP_RET encode_mjpeg(rkv_encoder_t *enc,
                             const void *pixels,
                             RK_S32 width, RK_S32 height,
                             RK_S32 hor_stride, RK_S32 ver_stride,
                             RK_S32 input_format, RK_S64 pts,
                             char *err_buf, int err_buf_len) {
+    /* Use the encoder's MCU-aligned strides regardless of what the
+     * per-call strided params say, so the HAL always sees a multiple
+     * of 16 in both dimensions and the JPEG HAL emits a properly
+     * terminated bitstream (see the long NOTE above ``enc->hor_stride``
+     * in :func:`rkv_enc_create`). The copy below pads the source. */
+    hor_stride = enc->hor_stride;
+    ver_stride = enc->ver_stride;
+
     MPP_RET ret = bind_packet(enc);
     if (ret != MPP_OK)
         return check(ret, "mpp_packet_init_with_buffer (mjpeg)",
@@ -605,8 +783,12 @@ static MPP_RET encode_mjpeg(rkv_encoder_t *enc,
                      "mpp_buffer_get_ptr_with_caller returned NULL");
         return MPP_ERR_BUFFER_FULL;
     }
-    memcpy(buf_ptr, pixels,
-           pixel_buf_size(input_format, hor_stride, ver_stride));
+    /* Copy row-wise into the MCU-aligned destination. When
+     * hor_stride == width and ver_stride == height this degenerates to
+     * the same byte sequence as a flat memcpy; when the strides have
+     * been rounded up, padding rows/columns are zero-filled. */
+    copy_padded_frame(buf_ptr, pixels, input_format,
+                      width, height, hor_stride, ver_stride);
     (void)mpp_buffer_sync_end_f(enc->frm_buf, 0, RKV_TAG_MODULE);
 
     mpp_packet_set_length(enc->packet, 0);
@@ -630,6 +812,14 @@ static MPP_RET encode_mjpeg(rkv_encoder_t *enc,
     enc->frame = NULL;
     if (ret != MPP_OK)
         return check(ret, "encode_put_frame (mjpeg)", err_buf, err_buf_len);
+
+    /* Drain the output task slot the encoder just enqueued, otherwise
+     * the output port fills to its capacity (mOutputTaskCount = 8 on
+     * RK3588) and the next :func:`encode_put_frame` blocks forever. */
+    ret = enc->api->encode_get_packet(enc->ctx, &enc->packet);
+    if (ret != MPP_OK) {
+        return check(ret, "encode_get_packet (mjpeg)", err_buf, err_buf_len);
+    }
     return MPP_OK;
 }
 
