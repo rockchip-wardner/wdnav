@@ -807,6 +807,36 @@ static MPP_RET encode_mjpeg(rkv_encoder_t *enc,
     mpp_frame_set_pts(enc->frame, pts);
     mpp_frame_set_buffer(enc->frame, enc->frm_buf);
     mpp_frame_set_meta(enc->frame, enc->meta);
+    /* NOTE 1 — keep the per-encoder meta alive across mpp_frame_deinit().
+     *
+     * ``mpp_frame_set_meta()`` only *stores* the pointer; it does not
+     * take a reference.  ``mpp_frame_deinit()`` (a few lines below)
+     * then does ``mpp_meta_put(frame->meta)`` — i.e. it **releases**
+     * the meta we just handed to the frame.  ``enc->meta`` is the
+     * per-encoder meta obtained *once* via ``mpp_meta_get_with_tag()``
+     * (a tag-keyed shared meta, ref_count 1), so every frame used to
+     * drop that count by one with no matching inc.  After two frames it
+     * went negative and the MPP core logged, once per frame:
+     *
+     *     mpp_meta: put_meta invalid negative ref_count -1
+     *     mpp_meta: put_meta invalid negative ref_count -2
+     *     ...
+     *
+     * Measured on RK3588: the HDMI-IN preview encoded at 30 fps and
+     * produced two journal lines per frame (the C library writes to
+     * both stdout and stderr) — 816k lines in one afternoon, which
+     * drowns every other log line.
+     *
+     * The fix is to take the reference the frame's deinit is about to
+     * drop: one ``mpp_meta_inc_ref()`` per frame, right here.  The
+     * encoder's own reference (from ``mpp_meta_get_with_tag()``) is
+     * released once in the destroy path, so the count stays balanced
+     * for the encoder's whole lifetime.
+     *
+     * ``mpp_meta_inc_ref`` is exported by librockchip_mpp.so but is not
+     * declared in the public header (see the extern above).
+     */
+    mpp_meta_inc_ref(enc->meta);
     ret = enc->api->encode_put_frame(enc->ctx, enc->frame);
     mpp_frame_deinit(&enc->frame);
     enc->frame = NULL;
