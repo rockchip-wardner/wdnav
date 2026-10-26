@@ -390,6 +390,21 @@ IM_SYNC = 1 << 19
 # color-space mode
 IM_COLOR_SPACE_DEFAULT = 0
 
+# YUV 源的色彩空间（写在 rga_buffer_t.color_space_mode 上）。
+#
+# RGA 默认按 **BT.601 限幅** 解读 YUV 源；HDMI 链路（TX 端 RGB→YUV）
+# 用的是 **BT.709 限幅**（rk_hdmirx 的 VIDIOC_G_FMT 也报
+# "YCbCr/HSV Encoding: xvYCC 709" / "Quantization: Limited Range"），
+# 不声明的话 YUV→RGB 会整体偏色（实测同一帧：默认 BT.601 与地面真相
+# 偏差 MAE 4.16，声明 BT.709 后 2.39）。
+#
+# 数值与 /usr/include/rga/im2d_type.h 的 IM_COLOR_SPACE_MODE 一致。
+IM_YUV_BT601_LIMIT_RANGE = 3 << 8
+IM_YUV_BT601_FULL_RANGE = 4 << 8
+IM_YUV_BT709_LIMIT_RANGE = 5 << 8
+IM_YUV_BT709_FULL_RANGE = 6 << 8
+IM_FULL_CSC_MASK = 0xF << 8
+
 # interpolation modes
 INTER_NEAREST = 0
 INTER_LINEAR = 1
@@ -962,15 +977,26 @@ def wrap_virtual(
     format: int,
     hstride: int = 0,
     wstride: int = 0,
+    color_space_mode: int = IM_COLOR_SPACE_DEFAULT,
 ) -> rga_buffer_t:
+    """Wrap a virtual address into an ``rga_buffer_t``.
+
+    ``color_space_mode`` declares the **source** colour space when the
+    buffer holds YUV (see :data:`IM_YUV_BT709_LIMIT_RANGE`).  The RGA
+    otherwise assumes BT.601 limited range, which shifts every colour
+    of a BT.709 source.
+    """
     if hstride == 0:
         hstride = height
     if wstride == 0:
         wstride = width
     with _rga_lock:
-        return _lib.wrapbuffer_virtualaddr_t(
+        buf = _lib.wrapbuffer_virtualaddr_t(
             c_void_p(vir_addr), width, height, wstride, hstride, format,
         )
+    if color_space_mode:
+        buf.color_space_mode = color_space_mode
+    return buf
 
 
 def wrap_fd(
@@ -1073,6 +1099,11 @@ __all__ = [
     "IM_STATUS_SUCCESS",
     "IM_STATUS_NOERROR",
     "IM_COLOR_SPACE_DEFAULT",
+    "IM_YUV_BT601_LIMIT_RANGE",
+    "IM_YUV_BT601_FULL_RANGE",
+    "IM_YUV_BT709_LIMIT_RANGE",
+    "IM_YUV_BT709_FULL_RANGE",
+    "IM_FULL_CSC_MASK",
     "IM_SYNC",
     "INTER_LINEAR",
 ]
