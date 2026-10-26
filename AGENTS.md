@@ -92,6 +92,33 @@ out.write(frame0)  # 0拷贝接口，传入dmabuffer结构体
 - 除非我要求，否则不要自动提交git commit
 - 由于视频编码出现python调用mpp和c调用mpp得到的sps pps不一致问题，所以我们封装一层高级的c shim接口给python调用
 
+## V4L2 采集：G_FMT 兜底与"撒谎的四cc"
+
+`src/wdnav/v4l2.py` 的 `_negotiate_format()` 带 **G_FMT 兜底**：
+
+1. 先按调用方请求的格式 S_FMT；
+2. 失败（EINVAL）就 `VIDIOC_G_FMT`（ioctl 号 `0xC0D05604`，上游 `v4l2`
+   包没导出，这里写死）问驱动"当前是什么格式"；
+3. 用驱动报的格式再 S_FMT 一次，成功就用它。
+
+**为什么必须有**：有些驱动只认自己那一种格式。本机 rk_hdmirx（RK3588
+HDMI-RX）只接受 `type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE + 'NV24'`，
+bgr3 / nv12 / rgb3 / yuyv / uyvy 一律
+`OSError: [Errno 22] Invalid argument` —— 没有兜底就永远打不开设备。
+
+**配套：驱动报的四cc可能是撒谎的。** rk_hdmirx 报 'NV24'（V4L2 规范里
+是 12bit YUV420SP），实际写进缓冲区的是 **8bit YUV422SP**（Y 平面 W*H +
+交错 UV 平面 W*H，共 2*W*H；缓冲区声明的 sizeimage 是 W*H*3，尾部 W*H
+字节是驱动没写的空洞）。按 fourcc 猜布局 → 满屏竖条纹。
+
+所以对外暴露了 :func:`frame_layout` / :attr:`V4L2Capture.frame_layout`：
+把"驱动报了什么"翻译成"数据实际长什么样"（payload: bgr24 / yuv422sp /
+yuv420sp + 每像素字节数 + 有效字节数）。已知会撒谎的驱动登记在
+`_DRIVER_PAYLOAD_OVERRIDES` 里。
+
+**调用方约定**：`V4L2Capture.pixel_format` 报的是**协商结果**，不是请求值
+（G_FMT 兜底后两者可能不同）；`V4L2BufferInfo.pixel_format` 同理。
+
 ## 编译策略 — `libshim_video.so` (v0.3.1 unconditional rebuild)
 
 `src/wdnav/_build_wdnav.py::build_py.run()` 在每次 `pip install` /

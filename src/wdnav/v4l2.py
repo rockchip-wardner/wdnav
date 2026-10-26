@@ -72,13 +72,35 @@ V4L2_FIELD_ANY = _v4l2.V4L2_FIELD_ANY
 V4L2_FIELD_NONE = _v4l2.V4L2_FIELD_NONE
 V4L2_MEMORY_MMAP = _v4l2.V4L2_MEMORY_MMAP
 
+# VIDIOC_G_FMT —— 问驱动"你现在给我的是什么格式"。
+#
+# 上游 `v4l2` 包没导出这个 ioctl 号（它只导出了 S_FMT 等少数几个），
+# 这里按 videodev2.h 的定义写死：
+#     #define VIDIOC_G_FMT  _IOWR('V', 4, struct v4l2_format)
+#     = (3<<30) | (208<<16) | ('V'<<8) | 4 = 0xC0D05604
+_VIDIOC_G_FMT = 0xC0D05604
+
+# 上游 `v4l2` 0.2 包缺的 FourCC（它的表只覆盖到 8bit YUV/RGB）：
+#   NV24/NV36/NV48 —— 12/14/16bit 的 NV12 变体（V4L2 规范，见 videodev2.h）
+#   BGR3          —— 'BGR3'，无 padding 的 24bit BGR；rk_hdmirx 的原生 RGB
+#                     输出格式就是这个（不是 BGR24）
+V4L2_PIX_FMT_NV24 = 0x3432564E
+V4L2_PIX_FMT_NV36 = 0x3633564E
+V4L2_PIX_FMT_NV48 = 0x3834564E
+V4L2_PIX_FMT_BGR3 = 0x33424742
+
 # Pixel format FourCCs we accept (string -> integer FourCC).
 _PIXEL_FORMATS = {
     "nv12": _v4l2.V4L2_PIX_FMT_NV12,
+    "nv16": _v4l2.V4L2_PIX_FMT_NV16,
     "nv21": _v4l2.V4L2_PIX_FMT_NV21,
+    "nv24": V4L2_PIX_FMT_NV24,
+    "nv36": V4L2_PIX_FMT_NV36,
+    "nv48": V4L2_PIX_FMT_NV48,
     "yuv420": _v4l2.V4L2_PIX_FMT_YUV420,    # I420
     "yuyv": _v4l2.V4L2_PIX_FMT_YUYV,
     "uyvy": _v4l2.V4L2_PIX_FMT_UYVY,
+    "bgr3": V4L2_PIX_FMT_BGR3,
     "bgr24": _v4l2.V4L2_PIX_FMT_BGR24,
     "rgb24": _v4l2.V4L2_PIX_FMT_RGB24,
     "mjpeg": _v4l2.V4L2_PIX_FMT_MJPEG,
@@ -99,6 +121,101 @@ def str_to_fourcc(s: str) -> int:
     # as "NV12". The kernel drivers validate exact character case and reject
     # lowercase, so normalize here.
     return _v4l2.v4l2_fourcc(*s.upper())
+
+
+# ---------------------------------------------------------------------------
+# Frame layout — 缓冲区里"实际躺着"的数据格式
+# ---------------------------------------------------------------------------
+#
+# 驱动报告的 fourcc **不一定**等于缓冲区里数据的真实布局。下表是实测
+# （本机 RK3588 / kernel 6.1.172 / rk_hdmirx，HDMI 源 1920x1080@60）：
+#
+#   * S_FMT 只接受 type=CAPTURE_MPLANE + 'NV24'。bgr3 / nv12 / rgb3 /
+#     yuyv / uyvy 一律 EINVAL（连 CAPTURE 单平面类型也全拒）。
+#   * 驱动报告 1 个 plane、bytesperline=1920、sizeimage=W*H*3。
+#   * 但缓冲区里实际是 **8bit YUV422SP**：Y 平面 W*H 字节 + 交错 UV 平面
+#     W*H 字节 = 2*W*H，剩下的 W*H 字节是驱动没写的空洞（读出来是噪点）。
+#     按 4:2:0 去读会看到满屏竖条纹；按 4:2:2 读才是一张干净画面。
+#
+# 也就是说 'NV24'（V4L2 规范里是 12bit YUV420SP）在这个驱动上是个
+# **撒谎的 fourcc**。调用方不能照着 fourcc 猜布局，得问本函数。
+
+#: payload 布局名 → 每像素字节数
+_PAYLOAD_BPP = {
+    "bgr24": 3.0,
+    "yuv422sp": 2.0,
+    "yuv420sp": 1.5,
+}
+
+#: 驱动 → fourcc → 真实 payload 的例外表。
+#:
+#: 只有**已知会撒谎**的驱动才登记在这里；其它驱动一律按 V4L2 规范的
+#: fourcc 语义解释（nv12→yuv420sp、bgr3/bgr24→bgr24、yuyv→yuv422sp...）。
+_DRIVER_PAYLOAD_OVERRIDES = {
+    "rk_hdmirx": {
+        # 见上面的实测记录：报 NV24，实际是 8bit YUV422SP。
+        "NV24": "yuv422sp",
+    },
+}
+
+#: 按 V4L2 规范，fourcc → payload 布局
+_FOURCC_PAYLOAD = {
+    "BGR3": "bgr24",
+    "BGR24": "bgr24",
+    "RGB24": "bgr24",     # RGA 侧按 BGR 读（RGA 只有 BGR/RGB 之分，通道序一致）
+    "NV12": "yuv420sp",
+    "NV16": "yuv422sp",
+    "NV21": "yuv420sp",
+    "YUYV": "yuv422sp",
+    "UYVY": "yuv422sp",
+    "YUV420": "yuv420sp",
+}
+
+
+@dataclass(frozen=True)
+class V4L2FrameLayout:
+    """一帧 V4L2 缓冲区的**实际**数据布局。
+
+    fourcc          驱动协商出来的 fourcc（如 "NV24"）—— 注意它可能"撒谎"，
+                    见 :func:`frame_layout` 的说明。
+    payload         缓冲区里真正躺着的布局，取值 "bgr24" / "yuv422sp" /
+                    "yuv420sp"。
+    bytes_per_pixel 每像素字节数（按 payload 算）。
+    usable_bytes    一帧有效字节数（0 = 未知 / 不适用）。
+    """
+
+    fourcc: str
+    payload: str
+    bytes_per_pixel: float
+    usable_bytes: int = 0
+
+
+def frame_layout(
+    fourcc: str,
+    driver: str = "",
+    width: int = 0,
+    height: int = 0,
+) -> V4L2FrameLayout:
+    """Describe the **real** layout of a capture buffer.
+
+    ``fourcc`` is what the driver negotiated (``V4L2Capture.pixel_format``),
+    ``driver`` its name (``V4L2Capture.driver``).  Returns the payload
+    layout to use when interpreting ``plane_arrays`` — for most drivers
+    that is the plain V4L2 meaning of the fourcc, but some (rk_hdmirx)
+    report a fourcc that does not match what they actually write.
+    """
+    fourcc = (fourcc or "").upper()
+    payload = _DRIVER_PAYLOAD_OVERRIDES.get(driver, {}).get(fourcc)
+    if payload is None:
+        payload = _FOURCC_PAYLOAD.get(fourcc, "")
+    bpp = _PAYLOAD_BPP.get(payload, 0.0)
+    usable = int(width * height * bpp) if (width and height and bpp) else 0
+    return V4L2FrameLayout(
+        fourcc=fourcc,
+        payload=payload,
+        bytes_per_pixel=bpp,
+        usable_bytes=usable,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +463,13 @@ class V4L2Capture:
             self._fmt = _negotiate_format(
                 self._fd, self._is_multiplanar, width, height, fmt_int
             )
-            self._pixel_format_str = pixel_format
+            # **协商结果**，不是调用方请求的那个 —— 走了 G_FMT 兜底之后
+            # 两者可能不同（比如请求 bgr3、驱动只给 NV24）。对外一律
+            # 报告实际拿到的格式。
+            self._pixel_format_str = fourcc_to_str(
+                self._fmt.pix_mp.pixelformat if self._is_multiplanar
+                else self._fmt.pix.pixelformat
+            )
 
             # Allocate + mmap buffers
             req = _v4l2.v4l2_requestbuffers()
@@ -407,6 +530,18 @@ class V4L2Capture:
         if self._is_multiplanar:
             return fourcc_to_str(self._fmt.pix_mp.pixelformat)
         return fourcc_to_str(self._fmt.pix.pixelformat)
+
+    @property
+    def frame_layout(self) -> V4L2FrameLayout:
+        """How to actually interpret ``plane_arrays``.
+
+        The negotiated fourcc is not always the truth (rk_hdmirx reports
+        'NV24' but writes 8bit YUV422SP) — this property resolves that
+        against the driver's known quirks.  See :func:`frame_layout`.
+        """
+        return frame_layout(
+            self.pixel_format, self._driver, self.width, self.height
+        )
 
     @property
     def num_planes(self) -> int:
@@ -727,7 +862,43 @@ def _ioctl_capture(fd, request: int, arg):
 
 
 def _negotiate_format(fd, is_mp: bool, width: int, height: int, fmt_int: int) -> v4l2_format:
-    """VIDIOC_S_FMT and return the *negotiated* format back."""
+    """VIDIOC_S_FMT and return the *negotiated* format back.
+
+    **G_FMT 兜底**：有些驱动（rk_hdmirx 就是典型）只接受"它自己当前
+    那个"格式，S_FMT 传别的 fourcc 一律 EINVAL。碰到这种驱动时：
+
+    1. 先按调用方要的格式 S_FMT；
+    2. 失败了（EINVAL）就 G_FMT 问驱动"你现在是什么格式"；
+    3. 拿驱动的格式再 S_FMT 一次，成功就用它。
+
+    没有这一步，HDMI-IN 这类"驱动只认一种格式"的设备会**永远打不开**
+    （表现为 open() 抛 ``OSError: [Errno 22] Invalid argument``）。
+    """
+    fmt = _fill_format(fd, is_mp, width, height, fmt_int)
+    try:
+        _ioctl_capture(fd, _v4l2.VIDIOC_S_FMT, fmt)
+        return fmt
+    except OSError as first_err:
+        # 驱动不认这个格式 —— 问它自己现在用的是什么。
+        try:
+            current = _ioctl_capture(fd, _VIDIOC_G_FMT, _fill_format(fd, is_mp, 0, 0, 0))
+        except OSError:
+            raise first_err
+        cur_int = (
+            current.pix_mp.pixelformat if is_mp else current.pix.pixelformat
+        )
+        if cur_int == fmt_int:
+            raise first_err
+        # 用驱动的格式重来一次（尺寸也用驱动报的，别再猜）。
+        cur_w = current.pix_mp.width if is_mp else current.pix.width
+        cur_h = current.pix_mp.height if is_mp else current.pix.height
+        retry = _fill_format(fd, is_mp, cur_w, cur_h, cur_int)
+        _ioctl_capture(fd, _v4l2.VIDIOC_S_FMT, retry)
+        return retry
+
+
+def _fill_format(fd, is_mp: bool, width: int, height: int, fmt_int: int) -> v4l2_format:
+    """Build a ``v4l2_format`` for S_FMT / G_FMT."""
     fmt = v4l2_format()
     fmt.type = (
         V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE if is_mp
@@ -743,18 +914,20 @@ def _negotiate_format(fd, is_mp: bool, width: int, height: int, fmt_int: int) ->
         fmt.pix.height = height
         fmt.pix.pixelformat = fmt_int
         fmt.pix.field = V4L2_FIELD_NONE
-    _ioctl_capture(fd, _v4l2.VIDIOC_S_FMT, fmt)
-    # fmt is now populated with the driver's actual width/height/bytesperline.
     return fmt
 
 
 __all__ = [
     "V4L2Capture",
     "V4L2BufferInfo",
+    "V4L2FrameLayout",
     "v4l2_exportbuffer",
     "VIDIOC_EXPBUF",
     "fourcc_to_str",
     "str_to_fourcc",
+    "frame_layout",
     "V4L2_CAP_VIDEO_CAPTURE_MPLANE",
     "V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE",
+    "V4L2_PIX_FMT_NV24",
+    "V4L2_PIX_FMT_BGR3",
 ]  # type: ignore[list-struct]  -- @formatter:off
