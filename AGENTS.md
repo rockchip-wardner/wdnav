@@ -107,13 +107,19 @@ bgr3 / nv12 / rgb3 / yuyv / uyvy 一律
 `OSError: [Errno 22] Invalid argument` —— 没有兜底就永远打不开设备。
 
 **配套：驱动报的四cc可能是撒谎的。** rk_hdmirx 报 'NV24'（V4L2 规范里
-是 12bit YUV420SP），实际写进缓冲区的是 **8bit YUV422SP**（Y 平面 W*H +
-交错 UV 平面 W*H，共 2*W*H；缓冲区声明的 sizeimage 是 W*H*3，尾部 W*H
-字节是驱动没写的空洞）。按 fourcc 猜布局 → 满屏竖条纹。
+是 12bit YUV420SP），实际写进缓冲区的是 **8bit YUV444**（Y 平面 W*H +
+**全宽**交错 CbCr 平面 2*W*H，合计正好 sizeimage=3*W*H，没有空洞）。
+按 fourcc 猜布局 → 满屏竖条纹。
+
+> 早先这里记的是「8bit YUV422SP + 尾部 W*H 空洞」，那是**误判**：
+> 把缓冲区按 (H,W,2) 拆成交错 Cb/Cr 与地面真相逐像素算相关性得
+> 0.988 / 0.998，按 4:2:2 读只有 0.07，Y 平面与真值亮度相关性 0.997。
+> 驱动自己的 `v4l2-ctl --list-formats-ext` 也把 NV24 写成
+> "'NV24' (Y/UV 4:4:4)"。
 
 所以对外暴露了 :func:`frame_layout` / :attr:`V4L2Capture.frame_layout`：
-把"驱动报了什么"翻译成"数据实际长什么样"（payload: bgr24 / yuv422sp /
-yuv420sp + 每像素字节数 + 有效字节数）。已知会撒谎的驱动登记在
+把"驱动报了什么"翻译成"数据实际长什么样"（payload: bgr24 / yuv444sp /
+yuv422sp / yuv420sp + 每像素字节数 + 有效字节数）。已知会撒谎的驱动登记在
 `_DRIVER_PAYLOAD_OVERRIDES` 里。
 
 **调用方约定**：`V4L2Capture.pixel_format` 报的是**协商结果**，不是请求值

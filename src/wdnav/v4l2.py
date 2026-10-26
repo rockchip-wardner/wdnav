@@ -130,19 +130,30 @@ def str_to_fourcc(s: str) -> int:
 # 驱动报告的 fourcc **不一定**等于缓冲区里数据的真实布局。下表是实测
 # （本机 RK3588 / kernel 6.1.172 / rk_hdmirx，HDMI 源 1920x1080@60）：
 #
-#   * S_FMT 只接受 type=CAPTURE_MPLANE + 'NV24'。bgr3 / nv12 / rgb3 /
-#     yuyv / uyvy 一律 EINVAL（连 CAPTURE 单平面类型也全拒）。
+#   * S_FMT 只接受 type=CAPTURE_MPLANE + 'NV24'。bgr3 / nv12 / nv16 /
+#     rgb3 / yuyv / uyvy 一律 EINVAL（连 CAPTURE 单平面类型也全拒）——
+#     驱动把格式写死了，**请求什么都是 NV24**。
 #   * 驱动报告 1 个 plane、bytesperline=1920、sizeimage=W*H*3。
-#   * 但缓冲区里实际是 **8bit YUV422SP**：Y 平面 W*H 字节 + 交错 UV 平面
-#     W*H 字节 = 2*W*H，剩下的 W*H 字节是驱动没写的空洞（读出来是噪点）。
-#     按 4:2:0 去读会看到满屏竖条纹；按 4:2:2 读才是一张干净画面。
+#   * 缓冲区里实际是 **8bit YUV444**（即 4:4:4）：Y 平面 W*H 字节 +
+#     **全宽**交错 CbCr 平面 2*W*H 字节，合计正好 sizeimage。
 #
-# 也就是说 'NV24'（V4L2 规范里是 12bit YUV420SP）在这个驱动上是个
-# **撒谎的 fourcc**。调用方不能照着 fourcc 猜布局，得问本函数。
+# 'NV24' 这个 fourcc 在 **V4L2 规范**里是 12bit YUV420SP，在 Rockchip 的
+# rk_hdmirx 上却是 4:4:4 —— 驱动自己的 `v4l2-ctl --list-formats-ext`
+# 也把它描述成 "'NV24' (Y/UV 4:4:4)"。所以这里按**驱动实测**而不是规范
+# 来登记。
+#
+# 实测方法（本机 HDMI-RX 回环本板 HDMI-OUT，X 抓屏当地面真相）：
+#   * 把缓冲区按 (H, W, 2) 拆成交错的 Cb/Cr，与地面真相逐像素算出来的
+#     Cb/Cr 相关性 = 0.988 / 0.998；按 4:2:2 读只有 0.07。
+#   * Y 平面与地面真相亮度的相关性 = 0.997。
+#
+# 也就是说 'NV24' 在这个驱动上是个**撒谎的 fourcc**。调用方不能照着
+# fourcc 猜布局，得问本函数。
 
 #: payload 布局名 → 每像素字节数
 _PAYLOAD_BPP = {
     "bgr24": 3.0,
+    "yuv444sp": 3.0,
     "yuv422sp": 2.0,
     "yuv420sp": 1.5,
 }
@@ -153,8 +164,8 @@ _PAYLOAD_BPP = {
 #: fourcc 语义解释（nv12→yuv420sp、bgr3/bgr24→bgr24、yuyv→yuv422sp...）。
 _DRIVER_PAYLOAD_OVERRIDES = {
     "rk_hdmirx": {
-        # 见上面的实测记录：报 NV24，实际是 8bit YUV422SP。
-        "NV24": "yuv422sp",
+        # 见上面的实测记录：报 NV24，实际是 8bit YUV444（Y + 全宽交错 CbCr）。
+        "NV24": "yuv444sp",
     },
 }
 
