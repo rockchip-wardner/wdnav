@@ -55,8 +55,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://example.com/wdnav"
-Issues = "https://example.com/wdnav/issues"
+Homepage = "https://github.com/rockchip-wardner/wdnav"
+Repository = "https://github.com/rockchip-wardner/wdnav"
+Issues = "https://github.com/rockchip-wardner/wdnav/issues"
 
 # ---------------------------------------------------------------------------
 # setuptools 配置：纯 Python 包 + 两个 C shim
