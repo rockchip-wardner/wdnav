@@ -1,3 +1,5 @@
+[English](README.md) | [简体中文](README_CN.md)
+
 # wdnav
 
 > Python bindings for Rockchip hardware video codec and graphics accelerator.
@@ -121,3 +123,7 @@ so install `opencv-python` first.
 
 - Target: Python 3.10+ (`requires-python = ">=3.10"`)
 - Platform: currently Linux (`.so`)
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
