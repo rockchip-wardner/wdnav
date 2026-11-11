@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wdnav"
-version = "0.5.2"
+version = "0.5.3"
 description = "Python bindings for Rockchip MPP / RGA2 / V4L2: hardware video decode and 2D acceleration"
 readme = "README.md"
 requires-python = ">=3.10"
